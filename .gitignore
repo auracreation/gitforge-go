@@ -1,0 +1,6 @@
+forge-darwin-*
+*.prof
+*.test
+*.out
+/tmp*
+.DS_Store
