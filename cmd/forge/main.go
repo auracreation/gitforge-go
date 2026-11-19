@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,27 +21,10 @@ import (
 	"gitforge/internal/store"
 )
 
-// tcpNoDelayListener wraps a *net.TCPListener so every accepted connection sets TCP_NODELAY
-// and keep-alive immediately (avoiding Nagle delays on loopback / gVisor Netstack).
-type tcpNoDelayListener struct {
-	*net.TCPListener
-}
-
-func (ln tcpNoDelayListener) Accept() (net.Conn, error) {
-	tc, err := ln.AcceptTCP()
-	if err != nil {
-		return nil, err
-	}
-	_ = tc.SetNoDelay(true)
-	_ = tc.SetKeepAlive(true)
-	_ = tc.SetKeepAlivePeriod(60 * time.Second)
-	return tc, nil
-}
-
 func main() {
-	// Respect the 1024 MiB sandbox RAM ceiling while avoiding excessive GC thrashing on transient HTTP buffers
+	// Hard ceiling below 1024 MiB pod limit; high GOGC prevents GC worker wakeups during timed rounds
 	debug.SetMemoryLimit(750 * 1024 * 1024)
-	debug.SetGCPercent(400)
+	debug.SetGCPercent(1000)
 
 	portFlag := flag.Int("port", 0, "TCP port to listen on (0 picks an ephemeral port)")
 	tokenFlag := flag.String("token", "", "override MAKEFUN_SHOP_TOKEN for standalone benchmarking")
@@ -64,38 +48,66 @@ func main() {
 	forge := store.NewForge(token)
 	router := server.NewRouter(forge)
 
-	rawLn, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *portFlag))
+	// Go's net.Listen("tcp", ...) enables TCP_NODELAY and keep-alives by default without extra setsockopt syscalls per Accept.
+	tcpLn, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *portFlag))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[entry] failed to bind TCP port: %v\n", err)
 		os.Exit(1)
 	}
-	tcpLn := tcpNoDelayListener{rawLn.(*net.TCPListener)}
 	boundPort := tcpLn.Addr().(*net.TCPAddr).Port
 
-	srv := &http.Server{
-		Handler:           router,
-		ReadHeaderTimeout: 30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    64 * 1024,
-	}
+	serverVariant := strings.ToLower(strings.TrimSpace(os.Getenv("FORGE_SERVER")))
 
-	go func() {
-		if serveErr := srv.Serve(tcpLn); serveErr != nil && serveErr != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "[entry] http server error: %v\n", serveErr)
-			os.Exit(1)
+	var (
+		srv     *http.Server
+		fastSrv *server.FastServer
+	)
+
+	if serverVariant == "fastconn" || serverVariant == "fastconn-close" {
+		fastSrv = server.NewFastServer(router)
+		if serverVariant == "fastconn-close" {
+			fastSrv.ForceClose = true
 		}
-	}()
+		go func() {
+			if serveErr := fastSrv.Start(tcpLn); serveErr != nil && !errors.Is(serveErr, net.ErrClosed) && serveErr != http.ErrServerClosed && !strings.Contains(serveErr.Error(), "closed network connection") {
+				fmt.Fprintf(os.Stderr, "[entry] fast server error: %v\n", serveErr)
+				os.Exit(1)
+			}
+		}()
+		fmt.Fprintf(os.Stdout, "[entry] starting FastServer (variant=%s)\n", serverVariant)
+	} else {
+		srv = &http.Server{
+			Handler:        router,
+			MaxHeaderBytes: 64 * 1024,
+		}
+		go func() {
+			if serveErr := srv.Serve(tcpLn); serveErr != nil && serveErr != http.ErrServerClosed {
+				fmt.Fprintf(os.Stderr, "[entry] http server error: %v\n", serveErr)
+				os.Exit(1)
+			}
+		}()
+		fmt.Fprintf(os.Stdout, "[entry] starting standard net/http Server\n")
+	}
 
 	fmt.Fprintf(os.Stdout, "[entry] listening on port %d\n", boundPort)
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
-	if *standalone {
-		<-sigCh
+	shutdown := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(ctx)
+		if fastSrv != nil {
+			_ = fastSrv.Shutdown(ctx)
+		}
+		if srv != nil {
+			_ = srv.Shutdown(ctx)
+		}
+	}
+
+	if *standalone {
+		<-sigCh
+		shutdown()
 		return
 	}
 
@@ -125,21 +137,15 @@ func main() {
 	case <-sigCh:
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
+	shutdown()
 	fmt.Fprintln(os.Stdout, "[entry] done")
 }
 
 func retryDelay(attempt int) time.Duration {
-	if attempt > 3 {
-		return 500 * time.Millisecond
+	if attempt >= 3 {
+		return 1500 * time.Millisecond
 	}
-	d := 100 * time.Millisecond * time.Duration(1<<attempt)
-	if d > 500*time.Millisecond {
-		return 500 * time.Millisecond
-	}
-	return d
+	return 250 * time.Millisecond * time.Duration(1<<attempt)
 }
 
 func registerWithEnv(client *http.Client, envURL string, port int) error {
@@ -165,6 +171,8 @@ func registerWithEnv(client *http.Client, envURL string, port int) error {
 	}
 }
 
+// waitForDone backs off exponentially up to 1.5s (matching starter/main.ts) so background polling
+// does not contend with the single-threaded env server during timed benchmark rounds.
 func waitForDone(client *http.Client, envURL string) {
 	for attempt := 0; ; attempt++ {
 		resp, err := client.Get(envURL + "/done")
@@ -177,8 +185,7 @@ func waitForDone(client *http.Client, envURL string) {
 			if resp.StatusCode == http.StatusOK && decErr == nil && status.Done {
 				return
 			}
-			attempt = 0
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(retryDelay(attempt))
 	}
 }

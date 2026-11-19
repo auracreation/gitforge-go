@@ -22,12 +22,14 @@ func (r *Repository) CreateLabel(name, color string) (Label, error) {
 	defer r.mu.Unlock()
 
 	cur := r.issueSnap.Load()
-	if existing, ok := cur.labels[name]; ok {
-		if existing.Color == color {
-			return existing, nil
-		}
+	existing, updating := cur.labels[name]
+	if updating && existing.Color == color {
+		return existing, nil
 	}
-	id := r.Forge.nextLabelID.Add(1)
+	id := existing.ID
+	if !updating {
+		id = r.Forge.nextLabelID.Add(1)
+	}
 	lbl := Label{
 		ID:    id,
 		Name:  name,
@@ -43,6 +45,41 @@ func (r *Repository) CreateLabel(name, color string) (Label, error) {
 
 	nextChunks := make([]*issueChunk, len(cur.chunks))
 	copy(nextChunks, cur.chunks)
+	if updating {
+		for chunkIndex, chunk := range cur.chunks {
+			if chunk == nil {
+				continue
+			}
+			for issueIndex, issue := range chunk {
+				if issue == nil {
+					continue
+				}
+				var changed *Issue
+				for labelIndex, attached := range issue.Labels {
+					if attached.Name != name {
+						continue
+					}
+					if changed == nil {
+						changed = &Issue{
+							ID: issue.ID, NodeID: issue.NodeID, Number: issue.Number,
+							Title: issue.Title, Body: issue.Body, State: issue.State,
+							Labels:    append([]Label(nil), issue.Labels...),
+							CreatedAt: issue.CreatedAt, UpdatedAt: issue.UpdatedAt,
+						}
+					}
+					changed.Labels[labelIndex] = lbl
+				}
+				if changed != nil {
+					changed.RestJSON = serializeIssueJSON(changed, r.Owner)
+					if nextChunks[chunkIndex] == chunk {
+						copyChunk := *chunk
+						nextChunks[chunkIndex] = &copyChunk
+					}
+					nextChunks[chunkIndex][issueIndex] = changed
+				}
+			}
+		}
+	}
 
 	r.issueSnap.Store(&IssueSnapshot{
 		Version:  cur.Version + 1,

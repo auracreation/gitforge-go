@@ -130,7 +130,18 @@ func ParseObjectType(name string) (ObjectType, bool) {
 }
 
 // HashObject computes the canonical Git SHA-1 over "<type> <len>\x00" + raw.
+// Uses a zero-allocation stack buffer + sha1.Sum fast path for objects up to 4 KiB.
 func HashObject(typ ObjectType, raw []byte) OID {
+	if len(raw) <= 4096 {
+		var stack [4128]byte
+		b := stack[:0]
+		b = append(b, typ.String()...)
+		b = append(b, ' ')
+		b = strconv.AppendInt(b, int64(len(raw)), 10)
+		b = append(b, 0)
+		b = append(b, raw...)
+		return OID(sha1.Sum(b))
+	}
 	h := sha1.New()
 	var hdr [32]byte
 	b := hdr[:0]

@@ -23,6 +23,14 @@ var UploadV2Capabilities = func() []byte {
 	return b
 }()
 
+// UploadV2HTTP200 is the pre-framed HTTP/1.1 200 OK response for v2 git-upload-pack info/refs.
+var UploadV2HTTP200 = BuildHTTPResponse(
+	"HTTP/1.1 200 OK",
+	"application/x-git-upload-pack-advertisement",
+	"Cache-Control: no-cache\r\n",
+	UploadV2Capabilities,
+)
+
 func (r *Repository) shardFor(oid gitobj.OID) *objShard {
 	return &r.shards[oid[0]&0x0f]
 }
@@ -281,6 +289,58 @@ func (s *GitSnapshot) ReceiveV0Advertisement() []byte {
 	return s.advReceiveV0
 }
 
+// ReceiveV0HTTP200 returns the cached complete HTTP/1.1 200 OK frame for git-receive-pack info/refs.
+func (s *GitSnapshot) ReceiveV0HTTP200() []byte {
+	s.recvAdvHTTPOnce.Do(func() {
+		s.advReceiveHTTP = BuildHTTPResponse(
+			"HTTP/1.1 200 OK",
+			"application/x-git-receive-pack-advertisement",
+			"Cache-Control: no-cache\r\n",
+			s.ReceiveV0Advertisement(),
+		)
+	})
+	return s.advReceiveHTTP
+}
+
+// LsRefsHTTP200 returns the cached complete HTTP/1.1 200 OK frame for default v2 ls-refs.
+func (s *GitSnapshot) LsRefsHTTP200() []byte {
+	s.lsRefsHTTPOnce.Do(func() {
+		body := s.Repo.formatLsRefs(s, LsRefsArgs{Peel: true, Symrefs: true, Unborn: true})
+		s.lsRefsHTTP200 = BuildHTTPResponse(
+			"HTTP/1.1 200 OK",
+			"application/x-git-upload-pack-result",
+			"Cache-Control: no-cache\r\n",
+			body,
+		)
+	})
+	return s.lsRefsHTTP200
+}
+
+// Depth1FetchHTTP200 returns the cached complete HTTP/1.1 200 OK frame for depth-1 shallow clone of HEAD.
+func (s *GitSnapshot) Depth1FetchHTTP200() ([]byte, bool) {
+	if !s.HasHead {
+		return nil, false
+	}
+	s.depth1HTTPOnce.Do(func() {
+		body, err := s.Repo.FetchUploadPack(FetchArgs{
+			Protocol: 2,
+			Wants:    []gitobj.OID{s.HeadOID},
+			Depth:    1,
+			Done:     true,
+			Sideband: true,
+		})
+		if err == nil && len(body) > 0 {
+			s.depth1HTTP200 = BuildHTTPResponse(
+				"HTTP/1.1 200 OK",
+				"application/x-git-upload-pack-result",
+				"Cache-Control: no-cache\r\n",
+				body,
+			)
+		}
+	})
+	return s.depth1HTTP200, len(s.depth1HTTP200) > 0
+}
+
 // Git returns the current lock-free GitSnapshot.
 func (r *Repository) Git() *GitSnapshot {
 	return r.gitSnap.Load()
@@ -377,7 +437,7 @@ func (r *Repository) verifyObjectClosure(rootOID gitobj.OID, knownCommits map[gi
 				if !checkTree(e.OID) {
 					return false
 				}
-			} else if !r.HasObject(e.OID) {
+			} else if !r.verifyTreeLeaf(e.Mode, e.OID) {
 				return false
 			}
 		}
@@ -391,8 +451,11 @@ func (r *Repository) verifyObjectClosure(rootOID gitobj.OID, knownCommits map[gi
 	case gitobj.ObjTree:
 		return checkTree(rootOID)
 	case gitobj.ObjTag:
-		target, _, valid := gitobj.ParseTag(obj.Raw)
+		target, targetType, valid := gitobj.ParseTag(obj.Raw)
 		if !valid {
+			return false
+		}
+		if targetObj, ok := r.GetObject(target); !ok || targetObj.Type != targetType {
 			return false
 		}
 		return r.verifyObjectClosure(target, knownCommits)
@@ -410,7 +473,7 @@ func (r *Repository) verifyObjectClosure(rootOID gitobj.OID, knownCommits map[gi
 			}
 			visited[cOID] = struct{}{}
 			pc, ok := r.GetCommit(cOID)
-			if !ok {
+			if !ok || pc.OID != cOID {
 				return false
 			}
 			if !checkTree(pc.Tree) {
@@ -428,6 +491,15 @@ func (r *Repository) verifyObjectClosure(rootOID gitobj.OID, knownCommits map[gi
 	}
 }
 
+func (r *Repository) verifyTreeLeaf(mode string, oid gitobj.OID) bool {
+	typ := gitobj.ObjBlob
+	if mode == "160000" {
+		typ = gitobj.ObjCommit
+	}
+	obj, ok := r.GetObject(oid)
+	return ok && obj.Type == typ
+}
+
 func (r *Repository) verifyTreeSimple(tOID gitobj.OID) bool {
 	tObj, ok := r.GetObject(tOID)
 	if !ok || tObj.Type != gitobj.ObjTree {
@@ -440,7 +512,8 @@ func (r *Repository) verifyTreeSimple(tOID gitobj.OID) bool {
 		if sp <= 0 {
 			return false
 		}
-		isDir := sp == 5 && string(raw[i:i+5]) == "40000" || sp == 6 && string(raw[i:i+6]) == "040000"
+		mode := string(raw[i : i+sp])
+		isDir := mode == "40000" || mode == "040000"
 		i += sp + 1
 		nul := bytes.IndexByte(raw[i:], 0)
 		if nul <= 0 {
@@ -457,7 +530,7 @@ func (r *Repository) verifyTreeSimple(tOID gitobj.OID) bool {
 			if !r.verifyTreeSimple(childOID) {
 				return false
 			}
-		} else if !r.HasObject(childOID) {
+		} else if !r.verifyTreeLeaf(mode, childOID) {
 			return false
 		}
 	}
@@ -531,7 +604,9 @@ func (r *Repository) ReceivePack(cmds []PushCommand, packBytes []byte, atomicPus
 	knownTips := make(map[gitobj.OID]struct{}, len(curSnap.Refs))
 	for k, v := range curSnap.Refs {
 		workingRefs[k] = v
-		knownTips[v] = struct{}{}
+		if obj, ok := r.GetObject(v); ok && obj.Type == gitobj.ObjCommit {
+			knownTips[v] = struct{}{}
+		}
 	}
 
 	statuses = make([]RefStatus, len(cmds))
@@ -578,7 +653,6 @@ func (r *Repository) ReceivePack(cmds []PushCommand, packBytes []byte, atomicPus
 				anyFailed = true
 			} else {
 				workingRefs[cmd.Ref] = cmd.NewOID
-				knownTips[cmd.NewOID] = struct{}{}
 				st.OK = true
 				anyChanged = true
 			}
@@ -600,11 +674,15 @@ func (r *Repository) ReceivePack(cmds []PushCommand, packBytes []byte, atomicPus
 				anyFailed = true
 			} else {
 				workingRefs[cmd.Ref] = cmd.NewOID
-				knownTips[cmd.NewOID] = struct{}{}
 				st.OK = true
 				if cmd.OldOID != cmd.NewOID {
 					anyChanged = true
 				}
+			}
+		}
+		if st.OK && !cmd.NewOID.IsZero() {
+			if obj, ok := r.GetObject(cmd.NewOID); ok && obj.Type == gitobj.ObjCommit {
+				knownTips[cmd.NewOID] = struct{}{}
 			}
 		}
 		statuses[i] = st
@@ -722,6 +800,8 @@ type FetchArgs struct {
 	Depth         int // 0 means full history, >= 1 means shallow depth
 	Done          bool
 	Sideband      bool
+	IncludeTag    bool
+	Negotiate     bool
 }
 
 // FetchUploadPack executes a lock-free Git upload-pack fetch against the current GitSnapshot.
@@ -758,8 +838,15 @@ func (r *Repository) FetchUploadPack(args FetchArgs) ([]byte, error) {
 	if args.Protocol == 2 && args.Done && args.Depth == 1 &&
 		snap.HasHead && len(args.Wants) == 1 && args.Wants[0] == snap.HeadOID &&
 		len(args.Haves) == 0 && len(args.ClientShallow) == 0 {
+		if args.IncludeTag {
+			for _, ref := range snap.SortedRefs {
+				if strings.HasPrefix(ref.Name, "refs/tags/") && ref.HasPeeled {
+					return r.buildFetchFramed(args, snap)
+				}
+			}
+		}
 		snap.depth1Once.Do(func() {
-			framed, err := r.buildFetchFramed(args)
+			framed, err := r.buildFetchFramed(args, snap)
 			if err == nil {
 				snap.depth1Framed = framed
 			}
@@ -769,10 +856,10 @@ func (r *Repository) FetchUploadPack(args FetchArgs) ([]byte, error) {
 		}
 	}
 
-	return r.buildFetchFramed(args)
+	return r.buildFetchFramed(args, snap)
 }
 
-func (r *Repository) buildFetchFramed(args FetchArgs) ([]byte, error) {
+func (r *Repository) buildFetchFramed(args FetchArgs, snap *GitSnapshot) ([]byte, error) {
 	clientShallowSet := make(map[gitobj.OID]struct{}, len(args.ClientShallow))
 	for _, s := range args.ClientShallow {
 		clientShallowSet[s] = struct{}{}
@@ -971,6 +1058,27 @@ func (r *Repository) buildFetchFramed(args FetchArgs) ([]byte, error) {
 		}
 	}
 
+	if args.Protocol == 0 && !args.Done {
+		var out []byte
+		for _, s := range sendShallow {
+			out = gitobj.AppendPktString(out, "shallow "+s.Hex()+"\n")
+		}
+		for _, u := range sendUnshallow {
+			out = gitobj.AppendPktString(out, "unshallow "+u.Hex()+"\n")
+		}
+		if args.Depth > 0 || len(sendShallow) > 0 || len(sendUnshallow) > 0 {
+			out = append(out, "0000"...)
+		}
+		if args.Negotiate {
+			if len(commonAcks) > 0 {
+				out = gitobj.AppendPktString(out, "ACK "+commonAcks[len(commonAcks)-1].Hex()+"\n")
+			} else {
+				out = gitobj.AppendPktString(out, "NAK\n")
+			}
+		}
+		return out, nil
+	}
+
 	// Step 4: Collect missing objects in clean commit -> tree -> blob order
 	var toSend []*gitobj.Object
 	for _, obj := range extraObjs {
@@ -1030,6 +1138,37 @@ func (r *Repository) buildFetchFramed(args FetchArgs) ([]byte, error) {
 		}
 	}
 
+	if args.IncludeTag {
+		packed := make(map[gitobj.OID]struct{}, len(toSend))
+		for _, obj := range toSend {
+			packed[obj.OID] = struct{}{}
+		}
+		for _, ref := range snap.SortedRefs {
+			if !strings.HasPrefix(ref.Name, "refs/tags/") || !ref.HasPeeled {
+				continue
+			}
+			if _, ok := packed[ref.PeeledOID]; !ok {
+				continue
+			}
+			for oid, hops := ref.OID, 0; hops < 8; hops++ {
+				obj, ok := r.GetObject(oid)
+				if !ok || obj.Type != gitobj.ObjTag {
+					break
+				}
+				if _, held := haveObjs[oid]; !held {
+					if _, sent := packed[oid]; !sent {
+						toSend = append(toSend, obj)
+						packed[oid] = struct{}{}
+					}
+				}
+				target, _, ok := gitobj.ParseTag(obj.Raw)
+				if !ok {
+					break
+				}
+				oid = target
+			}
+		}
+	}
 	pack := gitobj.BuildPack(toSend)
 
 	// Step 5: Frame response according to Protocol v2 or v0.
@@ -1059,7 +1198,7 @@ func (r *Repository) buildFetchFramed(args FetchArgs) ([]byte, error) {
 	for _, u := range sendUnshallow {
 		out = gitobj.AppendPktString(out, "unshallow "+u.Hex()+"\n")
 	}
-	if len(sendShallow) > 0 || len(sendUnshallow) > 0 {
+	if args.Depth > 0 || len(sendShallow) > 0 || len(sendUnshallow) > 0 {
 		out = append(out, "0000"...)
 	}
 	if len(commonAcks) > 0 {
@@ -1085,8 +1224,8 @@ func (r *Repository) CreateRef(ref string, sha string) (gitobj.OID, error) {
 	if !isValidGitRefName(ref) {
 		return gitobj.ZeroOID, &DomainError{Kind: ErrUnprocessable, Message: "Reference name is invalid"}
 	}
-	if !r.HasObject(oid) {
-		return gitobj.ZeroOID, &DomainError{Kind: ErrUnprocessable, Message: "Object does not exist"}
+	if !r.verifyRefTarget(ref, oid, nil) {
+		return gitobj.ZeroOID, &DomainError{Kind: ErrUnprocessable, Message: "Invalid reference target or missing necessary objects"}
 	}
 
 	r.mu.Lock()

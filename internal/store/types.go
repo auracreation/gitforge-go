@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"strconv"
@@ -55,18 +56,29 @@ type Comment struct {
 	RestJSON  []byte
 }
 
-// Issue is an immutable snapshot version of an issue with pre-serialized REST JSON.
+// Issue is an immutable snapshot version of an issue with pre-serialized REST JSON and lazy HTTP/1.1 wire frame.
 type Issue struct {
-	ID        int64
-	NodeID    string
-	Number    int
-	Title     string
-	Body      string
-	State     string // "open" | "closed"
-	Labels    []Label
-	CreatedAt string
-	UpdatedAt string
-	RestJSON  []byte
+	ID           int64
+	NodeID       string
+	Number       int
+	Title        string
+	Body         string
+	State        string // "open" | "closed"
+	Labels       []Label
+	CreatedAt    string
+	UpdatedAt    string
+	RestJSON     []byte
+	http200Frame atomic.Pointer[[]byte]
+}
+
+// HTTP200Frame returns the complete HTTP/1.1 200 OK wire frame for this issue, building and caching it once on first read.
+func (iss *Issue) HTTP200Frame() []byte {
+	if p := iss.http200Frame.Load(); p != nil {
+		return *p
+	}
+	frame := BuildHTTPResponse("HTTP/1.1 200 OK", "application/json; charset=utf-8", "", iss.RestJSON)
+	iss.http200Frame.Store(&frame)
+	return frame
 }
 
 const issueChunkSize = 64
@@ -206,14 +218,20 @@ type GitSnapshot struct {
 	upAdvOnce   sync.Once
 	advUploadV0 []byte
 
-	recvAdvOnce  sync.Once
-	advReceiveV0 []byte
+	recvAdvOnce     sync.Once
+	advReceiveV0    []byte
+	recvAdvHTTPOnce sync.Once
+	advReceiveHTTP  []byte
 
-	depth1Once   sync.Once
-	depth1Framed []byte
+	depth1Once     sync.Once
+	depth1Framed   []byte
+	depth1HTTPOnce sync.Once
+	depth1HTTP200  []byte
 
 	lsRefsSymPeelOnce sync.Once
 	lsRefsSymPeel     []byte
+	lsRefsHTTPOnce    sync.Once
+	lsRefsHTTP200     []byte
 }
 
 type objShard struct {
@@ -251,11 +269,14 @@ type RegistrySnapshot struct {
 
 // Forge is the top-level unified service backing all protocol endpoints.
 type Forge struct {
-	Viewer     User
-	Token      string
-	AuthHeader string // "Bearer " + Token
-	FixedNow   string // deterministic ISO-8601 timestamp
-	FixedEpoch int64  // deterministic Unix epoch seconds
+	Viewer          User
+	Token           string
+	AuthHeader      string // "Bearer " + Token
+	AuthHeaderBytes []byte
+	TokenBytes      []byte
+	ViewerBytes     []byte
+	FixedNow        string // deterministic ISO-8601 timestamp
+	FixedEpoch      int64  // deterministic Unix epoch seconds
 
 	reposMu  sync.Mutex
 	registry atomic.Pointer[RegistrySnapshot]
@@ -298,10 +319,13 @@ func NewForge(token string) *Forge {
 			Name:  name,
 			Email: login + "@example.invalid",
 		},
-		Token:      token,
-		AuthHeader: "Bearer " + token,
-		FixedNow:   fixedNow,
-		FixedEpoch: fixedEpoch,
+		Token:           token,
+		AuthHeader:      "Bearer " + token,
+		AuthHeaderBytes: []byte("Bearer " + token),
+		TokenBytes:      []byte(token),
+		ViewerBytes:     []byte(login),
+		FixedNow:        fixedNow,
+		FixedEpoch:      fixedEpoch,
 	}
 	f.nextRepoID.Store(5000)
 	f.nextIssueDBID.Store(10000)
@@ -317,7 +341,27 @@ func NewForge(token string) *Forge {
 	return f
 }
 
-// CheckAuth verifies the Authorization header against the configured Bearer token in constant-alloc style.
+// CheckAuthBytes verifies raw Authorization header bytes in zero heap allocations.
+func (f *Forge) CheckAuthBytes(auth []byte) bool {
+	if len(f.TokenBytes) == 0 {
+		return true
+	}
+	if bytes.Equal(auth, f.AuthHeaderBytes) {
+		return true
+	}
+	if len(auth) == len(f.AuthHeaderBytes) && strings.EqualFold(string(auth[:7]), "Bearer ") {
+		return bytes.Equal(auth[7:], f.TokenBytes)
+	}
+	return false
+}
+
+// GetRepoBytes performs a zero-allocation lookup for (owner, name) using Go's map[string(byteSlice)] optimization.
+func (f *Forge) GetRepoBytes(owner, name []byte) *Repository {
+	if !bytes.Equal(owner, f.ViewerBytes) {
+		return nil
+	}
+	return f.registry.Load().ByName[string(name)]
+}
 func (f *Forge) CheckAuth(authHeader string) bool {
 	if f.Token == "" {
 		return true
@@ -339,6 +383,22 @@ var preallocReqIDSlices = func() [8192][]string {
 	}
 	return tbl
 }()
+
+var preallocContentLengths = func() [4096][]string {
+	var tbl [4096][]string
+	for i := range tbl {
+		tbl[i] = []string{strconv.Itoa(i)}
+	}
+	return tbl
+}()
+
+// ContentLengthSlice returns a pre-allocated single-element Content-Length header slice when n < 4096.
+func ContentLengthSlice(n int) ([]string, bool) {
+	if n >= 0 && n < len(preallocContentLengths) {
+		return preallocContentLengths[n], true
+	}
+	return nil, false
+}
 
 // NextSeq returns a monotonic uint64 request sequence number.
 func (f *Forge) NextSeq() uint64 {

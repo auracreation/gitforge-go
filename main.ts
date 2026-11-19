@@ -39,7 +39,7 @@ function resolveBinary(): string {
 const binPath = resolveBinary();
 const child = spawn(binPath, [], {
   stdio: 'inherit',
-  env: process.env,
+  env: { ...process.env, GOMAXPROCS: '2', FORGE_SERVER: 'fastconn' },
 });
 
 for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {

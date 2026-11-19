@@ -155,6 +155,7 @@ func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, e
 	} else {
 		entries = make([]rawPackEntry, count)
 	}
+	objSlab := make([]Object, count)
 	var unresolved []int
 
 	pos := 12
@@ -191,14 +192,17 @@ func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, e
 			if err != nil {
 				return nil, err
 			}
-			// Allocate inflated + packSlice in one contiguous backing buffer to halve GC objects per object!
 			rawEntryLen := (pos - entryStart) + consumed
 			entryCopy := make([]byte, rawEntryLen)
 			copy(entryCopy, pack[entryStart:entryStart+rawEntryLen])
 			pos += consumed
 
 			oid := HashObject(typ, inflated)
-			obj := NewObjectWithPackEntry(oid, typ, inflated, entryCopy)
+			obj := &objSlab[i]
+			obj.OID = oid
+			obj.Type = typ
+			obj.Raw = inflated
+			obj.packEntry.Store(&entryCopy)
 			ent.resolved = obj
 
 		case ObjOfsDelta:
@@ -294,11 +298,10 @@ func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, e
 					return nil, err
 				}
 				oid := HashObject(base.Type, targetRaw)
-				obj := &Object{
-					OID:  oid,
-					Type: base.Type,
-					Raw:  targetRaw,
-				}
+				obj := &objSlab[idx]
+				obj.OID = oid
+				obj.Type = base.Type
+				obj.Raw = targetRaw
 				ent.resolved = obj
 				ent.data = nil
 				byOID[oid] = obj

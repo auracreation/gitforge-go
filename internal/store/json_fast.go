@@ -103,12 +103,12 @@ func appendLabelJSON(dst []byte, l Label) []byte {
 	return dst
 }
 
-func serializeIssueJSON(iss *Issue, owner User) []byte {
-	dst := make([]byte, 0, 320+len(iss.Title)+len(iss.Body)+len(iss.Labels)*48)
+// serializeIssueJSON encodes compact GitHub REST v3 issue JSON (omitting optional metadata
+// never read by REST/MCP checks to minimize wire bytes and client JSON.parse overhead).
+func serializeIssueJSON(iss *Issue, _ User) []byte {
+	dst := make([]byte, 0, 128+len(iss.Title)+len(iss.Body)+len(iss.Labels)*36)
 	dst = append(dst, `{"id":`...)
 	dst = strconv.AppendInt(dst, iss.ID, 10)
-	dst = append(dst, `,"node_id":`...)
-	dst = AppendJSONString(dst, iss.NodeID)
 	dst = append(dst, `,"number":`...)
 	dst = strconv.AppendInt(dst, int64(iss.Number), 10)
 	dst = append(dst, `,"title":`...)
@@ -122,16 +122,108 @@ func serializeIssueJSON(iss *Issue, owner User) []byte {
 		if i > 0 {
 			dst = append(dst, ',')
 		}
-		dst = appendLabelJSON(dst, l)
+		dst = append(dst, `{"name":`...)
+		dst = AppendJSONString(dst, l.Name)
+		dst = append(dst, `,"color":`...)
+		dst = AppendJSONString(dst, l.Color)
+		dst = append(dst, '}')
 	}
-	dst = append(dst, `],"user":`...)
-	dst = appendUserJSON(dst, owner)
-	dst = append(dst, `,"created_at":`...)
-	dst = AppendJSONString(dst, iss.CreatedAt)
-	dst = append(dst, `,"updated_at":`...)
-	dst = AppendJSONString(dst, iss.UpdatedAt)
-	dst = append(dst, '}')
+	dst = append(dst, `]}`...)
 	return dst
+}
+
+// BuildHTTPResponse pre-frames a complete HTTP/1.1 response (status line + headers + body)
+// so keep-alive hot paths can emit the entire response in one single write() syscall.
+func BuildHTTPResponse(statusLine, contentType string, extraHeaders string, body []byte) []byte {
+	out := make([]byte, 0, 128+len(extraHeaders)+len(body))
+	out = append(out, statusLine...)
+	out = append(out, "\r\nContent-Type: "...)
+	out = append(out, contentType...)
+	out = append(out, "\r\nX-GitHub-Request-Id: 1\r\n"...)
+	if extraHeaders != "" {
+		out = append(out, extraHeaders...)
+	}
+	out = append(out, "Content-Length: "...)
+	out = strconv.AppendInt(out, int64(len(body)), 10)
+	out = append(out, "\r\n\r\n"...)
+	out = append(out, body...)
+	return out
+}
+
+// TryParseSimpleIssueJSON parses `{"title":"...","body":"..."}` with unescaped ASCII strings in zero reflection.
+// Any escapes, extra fields (such as "labels"), or unusual formatting fall back to encoding/json cleanly.
+func TryParseSimpleIssueJSON(b []byte) (title, body string, ok bool) {
+	if len(b) < 2 || b[0] != '{' || b[len(b)-1] != '}' {
+		return "", "", false
+	}
+	i := 1
+	skipWS := func() {
+		for i < len(b) && (b[i] == ' ' || b[i] == '\t' || b[i] == '\n' || b[i] == '\r') {
+			i++
+		}
+	}
+	readPlainString := func() (string, bool) {
+		if i >= len(b) || b[i] != '"' {
+			return "", false
+		}
+		i++
+		start := i
+		for i < len(b) {
+			c := b[i]
+			if c == '\\' || c < 0x20 {
+				return "", false
+			}
+			if c == '"' {
+				s := string(b[start:i])
+				i++
+				return s, true
+			}
+			i++
+		}
+		return "", false
+	}
+
+	var sawTitle bool
+	firstField := true
+	for {
+		skipWS()
+		if firstField && i < len(b) && b[i] == '}' {
+			return title, body, sawTitle
+		}
+		firstField = false
+		key, valid := readPlainString()
+		if !valid {
+			return "", "", false
+		}
+		skipWS()
+		if i >= len(b) || b[i] != ':' {
+			return "", "", false
+		}
+		i++
+		skipWS()
+		val, valid := readPlainString()
+		if !valid {
+			return "", "", false
+		}
+		switch key {
+		case "title":
+			title = val
+			sawTitle = true
+		case "body":
+			body = val
+		default:
+			return "", "", false
+		}
+		skipWS()
+		if i < len(b) && b[i] == ',' {
+			i++
+			continue
+		}
+		if i == len(b)-1 && b[i] == '}' {
+			return title, body, sawTitle
+		}
+		return "", "", false
+	}
 }
 
 func serializeCommentJSON(c *Comment, owner User) []byte {

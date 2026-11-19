@@ -215,7 +215,8 @@ func (h *Handler) handleUploadPack(w http.ResponseWriter, r *http.Request, repo 
 		return
 	}
 
-	pkts, _, err := gitobj.DecodePktLines(body, 0)
+	var packets [16]gitobj.Packet
+	pkts, _, err := gitobj.DecodePktLines(packets[:0], body, 0)
 	if err != nil {
 		writeGitJSONError(h.Forge, w, http.StatusBadRequest, "Malformed pkt-line stream")
 		return
@@ -337,6 +338,8 @@ func (h *Handler) serveUploadPackV2(w http.ResponseWriter, repo *store.Repositor
 				fArgs.Depth = d
 			case string(raw) == "done":
 				fArgs.Done = true
+			case string(raw) == "include-tag":
+				fArgs.IncludeTag = true
 			}
 		}
 		if len(fArgs.Wants) == 0 {
@@ -364,9 +367,20 @@ func (h *Handler) serveUploadPackV0(w http.ResponseWriter, repo *store.Repositor
 		Protocol: 0,
 	}
 	parsedCaps := false
+	firstFlush := false
 	for _, p := range pkts {
+		if p.Kind == gitobj.PktFlush {
+			if firstFlush {
+				fArgs.Negotiate = true
+			}
+			firstFlush = true
+			continue
+		}
 		if p.Kind != gitobj.PktData {
 			continue
+		}
+		if firstFlush {
+			fArgs.Negotiate = true
 		}
 		line := string(gitobj.TrimLF(p.Payload))
 		if !parsedCaps {
@@ -382,6 +396,8 @@ func (h *Handler) serveUploadPackV0(w http.ResponseWriter, repo *store.Repositor
 			for _, capTok := range strings.Fields(capStr) {
 				if capTok == "side-band-64k" || capTok == "side-band" {
 					fArgs.Sideband = true
+				} else if capTok == "include-tag" {
+					fArgs.IncludeTag = true
 				}
 			}
 		}
@@ -439,7 +455,8 @@ func (h *Handler) handleReceivePack(w http.ResponseWriter, r *http.Request, repo
 		return
 	}
 
-	pkts, packOffset, err := gitobj.DecodePktLines(body, 1)
+	var packets [16]gitobj.Packet
+	pkts, packOffset, err := gitobj.DecodePktLines(packets[:0], body, 1)
 	if err != nil {
 		writeGitJSONError(h.Forge, w, http.StatusBadRequest, "Malformed receive-pack command stream")
 		return

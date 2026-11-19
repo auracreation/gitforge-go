@@ -23,11 +23,11 @@ type Packet struct {
 
 const maxPktLineLen = 65520
 
-// DecodePktLines decodes pkt-line frames from src.
+// DecodePktLines decodes pkt-line frames from src, reusing dst's storage.
 // When stopAfterFlush > 0, decoding stops after encountering that many flush (0000) packets
 // and returns the byte offset immediately following the final flush (used by receive-pack to slice the trailing packfile).
-func DecodePktLines(src []byte, stopAfterFlush int) ([]Packet, int, error) {
-	pkts := make([]Packet, 0, 8)
+func DecodePktLines(dst []Packet, src []byte, stopAfterFlush int) ([]Packet, int, error) {
+	pkts := dst[:0]
 	pos := 0
 	flushes := 0
 	for pos < len(src) {
