@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,27 +19,10 @@ import (
 	"gitforge/internal/store"
 )
 
-// tcpNoDelayListener wraps a *net.TCPListener so every accepted connection sets TCP_NODELAY
-// and keep-alive immediately (avoiding Nagle delays on loopback / gVisor Netstack).
-type tcpNoDelayListener struct {
-	*net.TCPListener
-}
-
-func (ln tcpNoDelayListener) Accept() (net.Conn, error) {
-	tc, err := ln.AcceptTCP()
-	if err != nil {
-		return nil, err
-	}
-	_ = tc.SetNoDelay(true)
-	_ = tc.SetKeepAlive(true)
-	_ = tc.SetKeepAlivePeriod(60 * time.Second)
-	return tc, nil
-}
-
 func main() {
-	// Respect the 1024 MiB sandbox RAM ceiling while avoiding excessive GC thrashing on transient HTTP buffers
+	// Respect the 1024 MiB sandbox RAM ceiling while avoiding GC pauses during timed benchmark rounds
 	debug.SetMemoryLimit(750 * 1024 * 1024)
-	debug.SetGCPercent(400)
+	debug.SetGCPercent(1000)
 
 	portFlag := flag.Int("port", 0, "TCP port to listen on (0 picks an ephemeral port)")
 	tokenFlag := flag.String("token", "", "override MAKEFUN_SHOP_TOKEN for standalone benchmarking")
@@ -64,23 +46,15 @@ func main() {
 	forge := store.NewForge(token)
 	router := server.NewRouter(forge)
 
-	rawLn, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *portFlag))
+	srv := server.NewFastServer(router)
+	boundPort, err := srv.BindPort(*portFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[entry] failed to bind TCP port: %v\n", err)
 		os.Exit(1)
 	}
-	tcpLn := tcpNoDelayListener{rawLn.(*net.TCPListener)}
-	boundPort := tcpLn.Addr().(*net.TCPAddr).Port
-
-	srv := &http.Server{
-		Handler:           router,
-		ReadHeaderTimeout: 30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    64 * 1024,
-	}
 
 	go func() {
-		if serveErr := srv.Serve(tcpLn); serveErr != nil && serveErr != http.ErrServerClosed {
+		if serveErr := srv.ServeBound(); serveErr != nil && serveErr != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "[entry] http server error: %v\n", serveErr)
 			os.Exit(1)
 		}

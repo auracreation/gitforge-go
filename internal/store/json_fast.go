@@ -103,8 +103,7 @@ func appendLabelJSON(dst []byte, l Label) []byte {
 	return dst
 }
 
-func serializeIssueJSON(iss *Issue, owner User) []byte {
-	dst := make([]byte, 0, 320+len(iss.Title)+len(iss.Body)+len(iss.Labels)*48)
+func appendIssueJSONBody(dst []byte, iss *Issue, ownerJSON []byte) []byte {
 	dst = append(dst, `{"id":`...)
 	dst = strconv.AppendInt(dst, iss.ID, 10)
 	dst = append(dst, `,"node_id":`...)
@@ -125,13 +124,31 @@ func serializeIssueJSON(iss *Issue, owner User) []byte {
 		dst = appendLabelJSON(dst, l)
 	}
 	dst = append(dst, `],"user":`...)
-	dst = appendUserJSON(dst, owner)
+	dst = append(dst, ownerJSON...)
 	dst = append(dst, `,"created_at":`...)
 	dst = AppendJSONString(dst, iss.CreatedAt)
 	dst = append(dst, `,"updated_at":`...)
 	dst = AppendJSONString(dst, iss.UpdatedAt)
 	dst = append(dst, '}')
 	return dst
+}
+
+// serializeIssueHTTP builds the complete HTTP/1.1 200 OK response and slices RestJSON from the same backing array.
+func serializeIssueHTTP(iss *Issue, ownerJSON []byte) (http200 []byte, restJSON []byte) {
+	var bodyStack [1024]byte
+	body := appendIssueJSONBody(bodyStack[:0], iss, ownerJSON)
+
+	var hdrStack [160]byte
+	hdr := append(hdrStack[:0], "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-GitHub-Request-Id: i"...)
+	hdr = strconv.AppendInt(hdr, iss.ID, 10)
+	hdr = append(hdr, "\r\nContent-Length: "...)
+	hdr = strconv.AppendInt(hdr, int64(len(body)), 10)
+	hdr = append(hdr, "\r\n\r\n"...)
+
+	buf := make([]byte, len(hdr)+len(body))
+	copy(buf, hdr)
+	copy(buf[len(hdr):], body)
+	return buf, buf[len(hdr):]
 }
 
 func serializeCommentJSON(c *Comment, owner User) []byte {

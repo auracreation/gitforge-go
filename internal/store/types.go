@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"strconv"
@@ -55,7 +56,8 @@ type Comment struct {
 	RestJSON  []byte
 }
 
-// Issue is an immutable snapshot version of an issue with pre-serialized REST JSON.
+// Issue is an immutable snapshot version of an issue with pre-serialized REST JSON
+// and pre-framed HTTP/1.1 200 OK wire response sharing the same backing array.
 type Issue struct {
 	ID        int64
 	NodeID    string
@@ -67,11 +69,14 @@ type Issue struct {
 	CreatedAt string
 	UpdatedAt string
 	RestJSON  []byte
+	HTTP200   []byte
 }
 
 const issueChunkSize = 64
 
-type issueChunk [issueChunkSize]*Issue
+type issueAtomicChunk struct {
+	slots [issueChunkSize]atomic.Pointer[Issue]
+}
 
 type precomputedIssueLists struct {
 	openAsc  []*Issue
@@ -80,67 +85,14 @@ type precomputedIssueLists struct {
 	allDesc  []*Issue
 }
 
-// IssueSnapshot provides lock-free O(1) reads via 64-way chunked copy-on-write arrays
-// and lazy versioned list indexes invalidated automatically on every mutation.
-type IssueSnapshot struct {
-	Version  uint64
-	MaxNum   int
-	Count    int
-	chunks   []*issueChunk
+type cachedIssueLists struct {
+	version uint64
+	lists   precomputedIssueLists
+}
+
+type issueMetaSnap struct {
 	labels   map[string]Label
 	comments map[int][]*Comment
-
-	listsOnce sync.Once
-	lists     precomputedIssueLists
-}
-
-// Get returns the Issue for 1-based number in O(1) with zero locks and zero allocations.
-func (s *IssueSnapshot) Get(number int) *Issue {
-	if number < 1 || number > s.MaxNum {
-		return nil
-	}
-	cIdx := number >> 6
-	if cIdx >= len(s.chunks) {
-		return nil
-	}
-	ch := s.chunks[cIdx]
-	if ch == nil {
-		return nil
-	}
-	return ch[number&63]
-}
-
-// Lists builds (at most once per snapshot version) and returns pre-sorted issue lists.
-func (s *IssueSnapshot) Lists() precomputedIssueLists {
-	s.listsOnce.Do(func() {
-		allAsc := make([]*Issue, 0, s.Count)
-		openAsc := make([]*Issue, 0, s.Count)
-		for num := 1; num <= s.MaxNum; num++ {
-			iss := s.Get(num)
-			if iss == nil {
-				continue
-			}
-			allAsc = append(allAsc, iss)
-			if iss.State == "open" {
-				openAsc = append(openAsc, iss)
-			}
-		}
-		allDesc := make([]*Issue, len(allAsc))
-		for i, v := range allAsc {
-			allDesc[len(allAsc)-1-i] = v
-		}
-		openDesc := make([]*Issue, len(openAsc))
-		for i, v := range openAsc {
-			openDesc[len(openAsc)-1-i] = v
-		}
-		s.lists = precomputedIssueLists{
-			openAsc:  openAsc,
-			openDesc: openDesc,
-			allAsc:   allAsc,
-			allDesc:  allDesc,
-		}
-	})
-	return s.lists
 }
 
 // PullRequest is an immutable snapshot version of a pull request.
@@ -194,26 +146,53 @@ type RefEntry struct {
 
 // GitSnapshot is an immutable publication of a repository's refs and cached advertisements.
 // Any push or commit publishes a new GitSnapshot, automatically invalidating shallow caches.
+// When a repository holds <= 1 ref, Refs stays nil and SortedRefs points into singleRef to eliminate map allocations.
 type GitSnapshot struct {
 	Repo       *Repository
 	Version    uint64
 	Refs       map[string]gitobj.OID
 	SortedRefs []RefEntry
+	singleRef  [1]RefEntry
 	HeadTarget string // e.g. "refs/heads/main"
 	HeadOID    gitobj.OID
 	HasHead    bool
 
-	upAdvOnce   sync.Once
-	advUploadV0 []byte
+	upAdvOnce       sync.Once
+	advUploadV0     []byte
+	advUploadV0HTTP []byte
 
-	recvAdvOnce  sync.Once
-	advReceiveV0 []byte
+	recvAdvOnce      sync.Once
+	advReceiveV0     []byte
+	advReceiveV0HTTP []byte
 
-	depth1Once   sync.Once
-	depth1Framed []byte
+	depth1Once       sync.Once
+	depth1Framed     []byte
+	depth1FramedHTTP []byte
 
 	lsRefsSymPeelOnce sync.Once
 	lsRefsSymPeel     []byte
+	lsRefsSymPeelHTTP []byte
+}
+
+// LookupRef returns the OID for a full Git ref name without requiring a map allocation on 1-ref repos.
+func (s *GitSnapshot) LookupRef(name string) (gitobj.OID, bool) {
+	if s.Refs != nil {
+		oid, ok := s.Refs[name]
+		return oid, ok
+	}
+	if len(s.SortedRefs) == 1 && s.SortedRefs[0].Name == name {
+		return s.SortedRefs[0].OID, true
+	}
+	return gitobj.ZeroOID, false
+}
+
+// CopyRefs returns a mutable map copy of all refs in s with room for extra entries.
+func (s *GitSnapshot) CopyRefs(extra int) map[string]gitobj.OID {
+	m := make(map[string]gitobj.OID, len(s.SortedRefs)+extra)
+	for _, ent := range s.SortedRefs {
+		m[ent.Name] = ent.OID
+	}
+	return m
 }
 
 type objShard struct {
@@ -232,12 +211,17 @@ type Repository struct {
 	FullName      string
 	DefaultBranch string
 
-	mu        sync.Mutex // repository-scoped write lock (held only during short commit/CAS sections)
-	nextNum   int        // shared per-repo issue & PR sequence (1, 2, 3...)
-	metaSnap  atomic.Pointer[RepoMeta]
-	gitSnap   atomic.Pointer[GitSnapshot]
-	issueSnap atomic.Pointer[IssueSnapshot]
-	pullSnap  atomic.Pointer[PullSnapshot]
+	mu             sync.Mutex // repository-scoped write lock (held only during short commit/CAS sections)
+	nextNum        int        // shared per-repo issue & PR sequence (1, 2, 3...)
+	metaSnap       atomic.Pointer[RepoMeta]
+	gitSnap        atomic.Pointer[GitSnapshot]
+	issueChunks    atomic.Pointer[[]*issueAtomicChunk]
+	issueMeta      atomic.Pointer[issueMetaSnap]
+	issueListCache atomic.Pointer[cachedIssueLists]
+	issueMaxNum    atomic.Int64
+	issueCount     atomic.Int64
+	issueVersion   atomic.Uint64
+	pullSnap       atomic.Pointer[PullSnapshot]
 
 	shards [16]objShard
 }
@@ -251,11 +235,15 @@ type RegistrySnapshot struct {
 
 // Forge is the top-level unified service backing all protocol endpoints.
 type Forge struct {
-	Viewer     User
-	Token      string
-	AuthHeader string // "Bearer " + Token
-	FixedNow   string // deterministic ISO-8601 timestamp
-	FixedEpoch int64  // deterministic Unix epoch seconds
+	Viewer           User
+	ViewerLoginBytes []byte
+	OwnerJSON        []byte // pre-serialized JSON for Viewer User object
+	Token            string
+	TokenBytes       []byte
+	AuthHeader       string // "Bearer " + Token
+	AuthHeaderBytes  []byte
+	FixedNow         string // deterministic ISO-8601 timestamp
+	FixedEpoch       int64  // deterministic Unix epoch seconds
 
 	reposMu  sync.Mutex
 	registry atomic.Pointer[RegistrySnapshot]
@@ -291,17 +279,22 @@ func NewForge(token string) *Forge {
 		}
 	}
 
+	viewer := User{
+		ID:    1000,
+		Login: login,
+		Name:  name,
+		Email: login + "@example.invalid",
+	}
 	f := &Forge{
-		Viewer: User{
-			ID:    1000,
-			Login: login,
-			Name:  name,
-			Email: login + "@example.invalid",
-		},
-		Token:      token,
-		AuthHeader: "Bearer " + token,
-		FixedNow:   fixedNow,
-		FixedEpoch: fixedEpoch,
+		Viewer:           viewer,
+		ViewerLoginBytes: []byte(login),
+		OwnerJSON:        appendUserJSON(make([]byte, 0, 96), viewer),
+		Token:            token,
+		TokenBytes:       []byte(token),
+		AuthHeader:       "Bearer " + token,
+		AuthHeaderBytes:  []byte("Bearer " + token),
+		FixedNow:         fixedNow,
+		FixedEpoch:       fixedEpoch,
 	}
 	f.nextRepoID.Store(5000)
 	f.nextIssueDBID.Store(10000)
@@ -328,6 +321,27 @@ func (f *Forge) CheckAuth(authHeader string) bool {
 	// Case-insensitive "Bearer " scheme check per RFC 6750
 	if len(authHeader) == len(f.AuthHeader) && strings.EqualFold(authHeader[:7], "Bearer ") {
 		return authHeader[7:] == f.Token
+	}
+	return false
+}
+
+// CheckAuthBytes verifies raw Authorization header bytes against the configured Bearer token with zero allocations.
+func (f *Forge) CheckAuthBytes(authHeader []byte) bool {
+	if len(f.TokenBytes) == 0 {
+		return true
+	}
+	if bytes.Equal(authHeader, f.AuthHeaderBytes) {
+		return true
+	}
+	if len(authHeader) == len(f.AuthHeaderBytes) &&
+		(authHeader[0]|0x20) == 'b' &&
+		(authHeader[1]|0x20) == 'e' &&
+		(authHeader[2]|0x20) == 'a' &&
+		(authHeader[3]|0x20) == 'r' &&
+		(authHeader[4]|0x20) == 'e' &&
+		(authHeader[5]|0x20) == 'r' &&
+		authHeader[6] == ' ' {
+		return bytes.Equal(authHeader[7:], f.TokenBytes)
 	}
 	return false
 }
@@ -359,7 +373,10 @@ func (f *Forge) NextRequestID() string {
 // Global Relay ID helpers (opaque, non-numeric, self-indexing, deterministic).
 
 func EncodeRepoNodeID(repoID int64) string {
-	return fmt.Sprintf("R_kgDO_%d", repoID)
+	var b [32]byte
+	out := append(b[:0], "R_kgDO_"...)
+	out = strconv.AppendInt(out, repoID, 10)
+	return string(out)
 }
 
 func DecodeRepoNodeID(nodeID string) (int64, bool) {
@@ -371,7 +388,12 @@ func DecodeRepoNodeID(nodeID string) (int64, bool) {
 }
 
 func EncodeIssueNodeID(repoID int64, number int) string {
-	return fmt.Sprintf("I_kwDO_%d_%d", repoID, number)
+	var b [48]byte
+	out := append(b[:0], "I_kwDO_"...)
+	out = strconv.AppendInt(out, repoID, 10)
+	out = append(out, '_')
+	out = strconv.AppendInt(out, int64(number), 10)
+	return string(out)
 }
 
 func DecodeIssueNodeID(nodeID string) (int64, int, bool) {
@@ -388,7 +410,12 @@ func DecodeIssueNodeID(nodeID string) (int64, int, bool) {
 }
 
 func EncodePullNodeID(repoID int64, number int) string {
-	return fmt.Sprintf("PR_kwDO_%d_%d", repoID, number)
+	var b [48]byte
+	out := append(b[:0], "PR_kwDO_"...)
+	out = strconv.AppendInt(out, repoID, 10)
+	out = append(out, '_')
+	out = strconv.AppendInt(out, int64(number), 10)
+	return string(out)
 }
 
 func DecodePullNodeID(nodeID string) (int64, int, bool) {
@@ -405,7 +432,14 @@ func DecodePullNodeID(nodeID string) (int64, int, bool) {
 }
 
 func EncodeCommentNodeID(repoID int64, issueNum int, commentID int64) string {
-	return fmt.Sprintf("IC_kwDO_%d_%d_%d", repoID, issueNum, commentID)
+	var b [64]byte
+	out := append(b[:0], "IC_kwDO_"...)
+	out = strconv.AppendInt(out, repoID, 10)
+	out = append(out, '_')
+	out = strconv.AppendInt(out, int64(issueNum), 10)
+	out = append(out, '_')
+	out = strconv.AppendInt(out, commentID, 10)
+	return string(out)
 }
 
 // CreateRepo creates a new viewer-owned repository, returning ErrUnprocessable (422) if it already exists.
@@ -437,8 +471,8 @@ func (f *Forge) CreateRepo(name, description string, private bool, defaultBranch
 		DefaultBranch: defaultBranch,
 	}
 	for i := range repo.shards {
-		repo.shards[i].objs = make(map[gitobj.OID]*gitobj.Object)
-		repo.shards[i].commits = make(map[gitobj.OID]*gitobj.ParsedCommit)
+		repo.shards[i].objs = make(map[gitobj.OID]*gitobj.Object, 16)
+		repo.shards[i].commits = make(map[gitobj.OID]*gitobj.ParsedCommit, 8)
 	}
 
 	meta := &RepoMeta{
@@ -448,11 +482,13 @@ func (f *Forge) CreateRepo(name, description string, private bool, defaultBranch
 	}
 	repo.metaSnap.Store(meta)
 	repo.gitSnap.Store(repo.buildGitSnapshot(1, nil))
-	repo.issueSnap.Store(&IssueSnapshot{
-		Version:  1,
+	initChunks := make([]*issueAtomicChunk, 4)
+	repo.issueChunks.Store(&initChunks)
+	repo.issueMeta.Store(&issueMetaSnap{
 		labels:   make(map[string]Label),
 		comments: make(map[int][]*Comment),
 	})
+	repo.issueVersion.Store(1)
 	repo.pullSnap.Store(&PullSnapshot{
 		ByNumber: make(map[int]*PullRequest),
 	})
@@ -487,6 +523,14 @@ func (f *Forge) GetRepo(owner, name string) *Repository {
 		return nil
 	}
 	return f.registry.Load().ByName[name]
+}
+
+// GetRepoBytes performs a zero-allocation lock-free O(1) lookup using raw owner/name byte slices.
+func (f *Forge) GetRepoBytes(owner, name []byte) *Repository {
+	if !bytes.Equal(owner, f.ViewerLoginBytes) {
+		return nil
+	}
+	return f.registry.Load().ByName[string(name)]
 }
 
 // GetRepoByID performs a lock-free O(1) lookup by database ID.

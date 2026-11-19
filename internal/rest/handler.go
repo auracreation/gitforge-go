@@ -438,7 +438,7 @@ func (h *Handler) handleGitData(w http.ResponseWriter, r *http.Request, repo *st
 	}
 	if len(segs) >= 2 && (segs[0] == "refs" || segs[0] == "ref") && r.Method == http.MethodGet {
 		subRef := "refs/" + strings.Join(segs[1:], "/")
-		oid, ok := repo.Git().Refs[subRef]
+		oid, ok := repo.Git().LookupRef(subRef)
 		if !ok {
 			h.writeRaw(w, http.StatusNotFound, notFoundBody)
 			return
@@ -509,6 +509,7 @@ func (h *Handler) handleCommits(w http.ResponseWriter, r *http.Request, repo *st
 	out := make([]byte, 0, 2+len(commits)*220)
 	out = append(out, '[')
 	for i, c := range commits {
+		c.EnsureMetadata()
 		if i > 0 {
 			out = append(out, ',')
 		}

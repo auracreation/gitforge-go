@@ -2,7 +2,9 @@ package gitobj
 
 import (
 	"crypto/sha1"
+	"hash"
 	"strconv"
+	"sync"
 )
 
 // OID is a 20-byte raw SHA-1 Git object identifier.
@@ -14,6 +16,23 @@ var ZeroOID OID
 const ZeroHex = "0000000000000000000000000000000000000000"
 
 const hexDigits = "0123456789abcdef"
+
+var hexValTable = func() [256]byte {
+	var t [256]byte
+	for i := range t {
+		t[i] = 0xff
+	}
+	for c := byte('0'); c <= '9'; c++ {
+		t[c] = c - '0'
+	}
+	for c := byte('a'); c <= 'f'; c++ {
+		t[c] = c - 'a' + 10
+	}
+	for c := byte('A'); c <= 'F'; c++ {
+		t[c] = c - 'A' + 10
+	}
+	return t
+}()
 
 // IsZero reports whether o equals ZeroOID.
 func (o OID) IsZero() bool {
@@ -41,16 +60,8 @@ func (o OID) AppendHex(dst []byte) []byte {
 }
 
 func fromHexNibble(c byte) (byte, bool) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', true
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, true
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, true
-	default:
-		return 0, false
-	}
+	v := hexValTable[c]
+	return v, v != 0xff
 }
 
 // ParseOID parses a 40-character hexadecimal SHA-1 string into an OID.
@@ -60,9 +71,9 @@ func ParseOID(s string) (OID, bool) {
 		return out, false
 	}
 	for i := 0; i < 20; i++ {
-		hi, ok1 := fromHexNibble(s[i*2])
-		lo, ok2 := fromHexNibble(s[i*2+1])
-		if !ok1 || !ok2 {
+		hi := hexValTable[s[i*2]]
+		lo := hexValTable[s[i*2+1]]
+		if (hi | lo) == 0xff {
 			return ZeroOID, false
 		}
 		out[i] = (hi << 4) | lo
@@ -77,9 +88,9 @@ func ParseOIDBytes(b []byte) (OID, bool) {
 		return out, false
 	}
 	for i := 0; i < 20; i++ {
-		hi, ok1 := fromHexNibble(b[i*2])
-		lo, ok2 := fromHexNibble(b[i*2+1])
-		if !ok1 || !ok2 {
+		hi := hexValTable[b[i*2]]
+		lo := hexValTable[b[i*2+1]]
+		if (hi | lo) == 0xff {
 			return ZeroOID, false
 		}
 		out[i] = (hi << 4) | lo
@@ -129,9 +140,26 @@ func ParseObjectType(name string) (ObjectType, bool) {
 	}
 }
 
-// HashObject computes the canonical Git SHA-1 over "<type> <len>\x00" + raw.
+var sha1Pool = sync.Pool{
+	New: func() any {
+		return sha1.New()
+	},
+}
+
+// HashObject computes the canonical Git SHA-1 over "<type> <len>\x00" + raw with zero heap allocations.
 func HashObject(typ ObjectType, raw []byte) OID {
-	h := sha1.New()
+	if len(raw) <= 2016 {
+		var buf [2048]byte
+		b := buf[:0]
+		b = append(b, typ.String()...)
+		b = append(b, ' ')
+		b = strconv.AppendInt(b, int64(len(raw)), 10)
+		b = append(b, 0)
+		b = append(b, raw...)
+		return OID(sha1.Sum(b))
+	}
+	h := sha1Pool.Get().(hash.Hash)
+	h.Reset()
 	var hdr [32]byte
 	b := hdr[:0]
 	b = append(b, typ.String()...)
@@ -142,5 +170,6 @@ func HashObject(typ ObjectType, raw []byte) OID {
 	h.Write(raw)
 	var out OID
 	h.Sum(out[:0])
+	sha1Pool.Put(h)
 	return out
 }

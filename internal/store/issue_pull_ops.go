@@ -7,7 +7,7 @@ import (
 	"gitforge/internal/gitobj"
 )
 
-// CreateLabel adds or updates a repository label and publishes a new IssueSnapshot.
+// CreateLabel adds or updates a repository label atomically.
 func (r *Repository) CreateLabel(name, color string) (Label, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -21,7 +21,7 @@ func (r *Repository) CreateLabel(name, color string) (Label, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	cur := r.issueSnap.Load()
+	cur := r.issueMeta.Load()
 	if existing, ok := cur.labels[name]; ok {
 		if existing.Color == color {
 			return existing, nil
@@ -41,21 +41,14 @@ func (r *Repository) CreateLabel(name, color string) (Label, error) {
 	}
 	nextLabels[name] = lbl
 
-	nextChunks := make([]*issueChunk, len(cur.chunks))
-	copy(nextChunks, cur.chunks)
-
-	r.issueSnap.Store(&IssueSnapshot{
-		Version:  cur.Version + 1,
-		MaxNum:   cur.MaxNum,
-		Count:    cur.Count,
-		chunks:   nextChunks,
+	r.issueMeta.Store(&issueMetaSnap{
 		labels:   nextLabels,
 		comments: cur.comments,
 	})
 	return lbl, nil
 }
 
-// CreateIssue validates labels, pre-serializes JSON, and publishes a new chunked IssueSnapshot in O(1).
+// CreateIssue validates labels, pre-serializes HTTP/JSON, and publishes into lock-free atomic chunks in O(1).
 func (r *Repository) CreateIssue(title, body string, labelNames []string) (*Issue, error) {
 	title = strings.TrimSpace(title)
 	if title == "" {
@@ -64,9 +57,9 @@ func (r *Repository) CreateIssue(title, body string, labelNames []string) (*Issu
 
 	// Fast lock-free pre-check of labels when labelNames are supplied
 	if len(labelNames) > 0 {
-		snap := r.issueSnap.Load()
+		meta := r.issueMeta.Load()
 		for _, ln := range labelNames {
-			if _, ok := snap.labels[ln]; !ok {
+			if _, ok := meta.labels[ln]; !ok {
 				return nil, &DomainError{Kind: ErrUnprocessable, Message: "Unknown label: " + ln}
 			}
 		}
@@ -76,13 +69,12 @@ func (r *Repository) CreateIssue(title, body string, labelNames []string) (*Issu
 	now := r.Forge.FixedNow
 
 	r.mu.Lock()
-	cur := r.issueSnap.Load()
-
 	var resolvedLabels []Label
 	if len(labelNames) > 0 {
+		meta := r.issueMeta.Load()
 		resolvedLabels = make([]Label, 0, len(labelNames))
 		for _, ln := range labelNames {
-			lbl, ok := cur.labels[ln]
+			lbl, ok := meta.labels[ln]
 			if !ok {
 				r.mu.Unlock()
 				return nil, &DomainError{Kind: ErrUnprocessable, Message: "Unknown label: " + ln}
@@ -104,38 +96,58 @@ func (r *Repository) CreateIssue(title, body string, labelNames []string) (*Issu
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	iss.RestJSON = serializeIssueJSON(iss, r.Owner)
+	iss.HTTP200, iss.RestJSON = serializeIssueHTTP(iss, r.Forge.OwnerJSON)
 
 	cIdx := num >> 6
-	neededLen := cIdx + 1
-	if len(cur.chunks) > neededLen {
-		neededLen = len(cur.chunks)
+	tblPtr := r.issueChunks.Load()
+	tbl := *tblPtr
+	if cIdx >= len(tbl) {
+		newLen := len(tbl) * 2
+		if newLen <= cIdx {
+			newLen = cIdx + 4
+		}
+		grown := make([]*issueAtomicChunk, newLen)
+		copy(grown, tbl)
+		ch := new(issueAtomicChunk)
+		ch.slots[num&63].Store(iss)
+		grown[cIdx] = ch
+		r.issueChunks.Store(&grown)
+	} else {
+		ch := tbl[cIdx]
+		if ch == nil {
+			ch = new(issueAtomicChunk)
+			ch.slots[num&63].Store(iss)
+			// Copy small slice header only once per 64 issues so readers never race on slice element write
+			grown := make([]*issueAtomicChunk, len(tbl))
+			copy(grown, tbl)
+			grown[cIdx] = ch
+			r.issueChunks.Store(&grown)
+		} else {
+			ch.slots[num&63].Store(iss)
+		}
 	}
-	nextChunks := make([]*issueChunk, neededLen)
-	copy(nextChunks, cur.chunks)
-
-	var leaf issueChunk
-	if cIdx < len(cur.chunks) && cur.chunks[cIdx] != nil {
-		leaf = *cur.chunks[cIdx]
-	}
-	leaf[num&63] = iss
-	nextChunks[cIdx] = &leaf
-
-	r.issueSnap.Store(&IssueSnapshot{
-		Version:  cur.Version + 1,
-		MaxNum:   num,
-		Count:    cur.Count + 1,
-		chunks:   nextChunks,
-		labels:   cur.labels,
-		comments: cur.comments,
-	})
+	r.issueMaxNum.Store(int64(num))
+	r.issueCount.Add(1)
+	r.issueVersion.Add(1)
 	r.mu.Unlock()
 	return iss, nil
 }
 
-// GetIssue performs a lock-free O(1) read from the current IssueSnapshot.
+// GetIssue performs a lock-free O(1) read from the atomic chunk table.
 func (r *Repository) GetIssue(number int) *Issue {
-	return r.issueSnap.Load().Get(number)
+	if number < 1 {
+		return nil
+	}
+	tbl := *r.issueChunks.Load()
+	cIdx := number >> 6
+	if cIdx >= len(tbl) {
+		return nil
+	}
+	ch := tbl[cIdx]
+	if ch == nil {
+		return nil
+	}
+	return ch.slots[number&63].Load()
 }
 
 // IssuePatch describes fields updated via PATCH /issues/{n} or GraphQL closeIssue.
@@ -146,13 +158,12 @@ type IssuePatch struct {
 	Labels *[]string
 }
 
-// UpdateIssue updates an existing issue and publishes a new IssueSnapshot invalidating cached views.
+// UpdateIssue updates an existing issue atomically and invalidates cached list views.
 func (r *Repository) UpdateIssue(number int, patch IssuePatch) (*Issue, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	cur := r.issueSnap.Load()
-	old := cur.Get(number)
+	old := r.GetIssue(number)
 	if old == nil {
 		return nil, &DomainError{Kind: ErrNotFound, Message: "Not Found"}
 	}
@@ -179,9 +190,10 @@ func (r *Repository) UpdateIssue(number int, patch IssuePatch) (*Issue, error) {
 	}
 	labels := old.Labels
 	if patch.Labels != nil {
+		meta := r.issueMeta.Load()
 		labels = make([]Label, 0, len(*patch.Labels))
 		for _, ln := range *patch.Labels {
-			lbl, ok := cur.labels[ln]
+			lbl, ok := meta.labels[ln]
 			if !ok {
 				return nil, &DomainError{Kind: ErrUnprocessable, Message: "Unknown label: " + ln}
 			}
@@ -200,30 +212,75 @@ func (r *Repository) UpdateIssue(number int, patch IssuePatch) (*Issue, error) {
 		CreatedAt: old.CreatedAt,
 		UpdatedAt: r.Forge.FixedNow,
 	}
-	updated.RestJSON = serializeIssueJSON(updated, r.Owner)
+	updated.HTTP200, updated.RestJSON = serializeIssueHTTP(updated, r.Forge.OwnerJSON)
 
-	cIdx := number >> 6
-	nextChunks := make([]*issueChunk, len(cur.chunks))
-	copy(nextChunks, cur.chunks)
-	leaf := *cur.chunks[cIdx]
-	leaf[number&63] = updated
-	nextChunks[cIdx] = &leaf
-
-	r.issueSnap.Store(&IssueSnapshot{
-		Version:  cur.Version + 1,
-		MaxNum:   cur.MaxNum,
-		Count:    cur.Count,
-		chunks:   nextChunks,
-		labels:   cur.labels,
-		comments: cur.comments,
-	})
+	tbl := *r.issueChunks.Load()
+	tbl[number>>6].slots[number&63].Store(updated)
+	r.issueVersion.Add(1)
 	return updated, nil
 }
 
-// ListIssues returns filtered, ordered, and paginated issues from the immutable IssueSnapshot.
+func (r *Repository) issueLists() precomputedIssueLists {
+	ver := r.issueVersion.Load()
+	if c := r.issueListCache.Load(); c != nil && c.version == ver {
+		return c.lists
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ver = r.issueVersion.Load()
+	if c := r.issueListCache.Load(); c != nil && c.version == ver {
+		return c.lists
+	}
+
+	maxNum := int(r.issueMaxNum.Load())
+	count := int(r.issueCount.Load())
+	tbl := *r.issueChunks.Load()
+	allAsc := make([]*Issue, 0, count)
+	openAsc := make([]*Issue, 0, count)
+	for num := 1; num <= maxNum; num++ {
+		cIdx := num >> 6
+		if cIdx >= len(tbl) {
+			break
+		}
+		ch := tbl[cIdx]
+		if ch == nil {
+			continue
+		}
+		iss := ch.slots[num&63].Load()
+		if iss == nil {
+			continue
+		}
+		allAsc = append(allAsc, iss)
+		if iss.State == "open" {
+			openAsc = append(openAsc, iss)
+		}
+	}
+	allDesc := make([]*Issue, len(allAsc))
+	for i, v := range allAsc {
+		allDesc[len(allAsc)-1-i] = v
+	}
+	openDesc := make([]*Issue, len(openAsc))
+	for i, v := range openAsc {
+		openDesc[len(openAsc)-1-i] = v
+	}
+	lists := precomputedIssueLists{
+		openAsc:  openAsc,
+		openDesc: openDesc,
+		allAsc:   allAsc,
+		allDesc:  allDesc,
+	}
+	r.issueListCache.Store(&cachedIssueLists{
+		version: ver,
+		lists:   lists,
+	})
+	return lists
+}
+
+// ListIssues returns filtered, ordered, and paginated issues from the versioned list cache.
 func (r *Repository) ListIssues(state, direction string, page, perPage int) ([]*Issue, bool) {
-	snap := r.issueSnap.Load()
-	lists := snap.Lists()
+	lists := r.issueLists()
 
 	state = strings.ToLower(strings.TrimSpace(state))
 	if state == "" {
@@ -282,7 +339,7 @@ func (r *Repository) ListIssues(state, direction string, page, perPage int) ([]*
 	return base[start:end], hasMore
 }
 
-// AddComment appends a comment to an issue (or pull request) and publishes a new IssueSnapshot.
+// AddComment appends a comment to an issue (or pull request) atomically.
 func (r *Repository) AddComment(number int, body string) (*Comment, error) {
 	if strings.TrimSpace(body) == "" {
 		return nil, &DomainError{Kind: ErrUnprocessable, Message: "Comment body cannot be empty"}
@@ -291,9 +348,9 @@ func (r *Repository) AddComment(number int, body string) (*Comment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	curIss := r.issueSnap.Load()
+	curMeta := r.issueMeta.Load()
 	curPull := r.pullSnap.Load()
-	if curIss.Get(number) == nil && curPull.ByNumber[number] == nil {
+	if r.GetIssue(number) == nil && curPull.ByNumber[number] == nil {
 		return nil, &DomainError{Kind: ErrNotFound, Message: "Not Found"}
 	}
 
@@ -306,22 +363,18 @@ func (r *Repository) AddComment(number int, body string) (*Comment, error) {
 	}
 	c.RestJSON = serializeCommentJSON(c, r.Owner)
 
-	nextComments := make(map[int][]*Comment, len(curIss.comments)+1)
-	for k, v := range curIss.comments {
+	nextComments := make(map[int][]*Comment, len(curMeta.comments)+1)
+	for k, v := range curMeta.comments {
 		nextComments[k] = v
 	}
-	prevList := curIss.comments[number]
+	prevList := curMeta.comments[number]
 	nextList := make([]*Comment, len(prevList)+1)
 	copy(nextList, prevList)
 	nextList[len(prevList)] = c
 	nextComments[number] = nextList
 
-	r.issueSnap.Store(&IssueSnapshot{
-		Version:  curIss.Version + 1,
-		MaxNum:   curIss.MaxNum,
-		Count:    curIss.Count,
-		chunks:   curIss.chunks,
-		labels:   curIss.labels,
+	r.issueMeta.Store(&issueMetaSnap{
+		labels:   curMeta.labels,
 		comments: nextComments,
 	})
 	return c, nil
@@ -329,11 +382,10 @@ func (r *Repository) AddComment(number int, body string) (*Comment, error) {
 
 // ListComments returns the immutable comment slice for an issue or pull request.
 func (r *Repository) ListComments(number int) ([]*Comment, error) {
-	curIss := r.issueSnap.Load()
-	if curIss.Get(number) == nil && r.pullSnap.Load().ByNumber[number] == nil {
+	if r.GetIssue(number) == nil && r.pullSnap.Load().ByNumber[number] == nil {
 		return nil, &DomainError{Kind: ErrNotFound, Message: "Not Found"}
 	}
-	list := curIss.comments[number]
+	list := r.issueMeta.Load().comments[number]
 	if list == nil {
 		return []*Comment{}, nil
 	}
@@ -357,8 +409,8 @@ func (r *Repository) CreatePull(title, body, head, base string) (*PullRequest, e
 	defer r.mu.Unlock()
 
 	gitSnap := r.gitSnap.Load()
-	headOID, okHead := gitSnap.Refs["refs/heads/"+head]
-	baseOID, okBase := gitSnap.Refs["refs/heads/"+base]
+	headOID, okHead := gitSnap.LookupRef("refs/heads/" + head)
+	baseOID, okBase := gitSnap.LookupRef("refs/heads/" + base)
 	if !okHead || !okBase {
 		return nil, &DomainError{Kind: ErrUnprocessable, Message: "Head or base branch does not exist"}
 	}
@@ -415,11 +467,11 @@ func (r *Repository) GetPull(number int) (*PullRequest, []byte, bool) {
 	}
 	gitSnap := r.gitSnap.Load()
 	headSHA := pr.HeadSHA
-	if hOID, ok := gitSnap.Refs["refs/heads/"+pr.HeadRef]; ok {
+	if hOID, ok := gitSnap.LookupRef("refs/heads/" + pr.HeadRef); ok {
 		headSHA = hOID.Hex()
 	}
 	baseSHA := pr.BaseSHA
-	if bOID, ok := gitSnap.Refs["refs/heads/"+pr.BaseRef]; ok {
+	if bOID, ok := gitSnap.LookupRef("refs/heads/" + pr.BaseRef); ok {
 		baseSHA = bOID.Hex()
 	}
 	if headSHA == pr.HeadSHA && baseSHA == pr.BaseSHA {
@@ -471,12 +523,12 @@ func (r *Repository) GetPullFiles(number int) ([]PullFile, error) {
 	gitSnap := r.gitSnap.Load()
 	var baseOID, headOID gitobj.OID
 	if pr.State == "open" {
-		if b, ok := gitSnap.Refs["refs/heads/"+pr.BaseRef]; ok {
+		if b, ok := gitSnap.LookupRef("refs/heads/" + pr.BaseRef); ok {
 			baseOID = b
 		} else {
 			baseOID, _ = gitobj.ParseOID(pr.BaseSHA)
 		}
-		if h, ok := gitSnap.Refs["refs/heads/"+pr.HeadRef]; ok {
+		if h, ok := gitSnap.LookupRef("refs/heads/" + pr.HeadRef); ok {
 			headOID = h
 		} else {
 			headOID, _ = gitobj.ParseOID(pr.HeadSHA)
@@ -494,8 +546,8 @@ func (r *Repository) PullMergeableState(pr *PullRequest) string {
 		return "UNKNOWN"
 	}
 	gitSnap := r.gitSnap.Load()
-	baseOID, okB := gitSnap.Refs["refs/heads/"+pr.BaseRef]
-	headOID, okH := gitSnap.Refs["refs/heads/"+pr.HeadRef]
+	baseOID, okB := gitSnap.LookupRef("refs/heads/" + pr.BaseRef)
+	headOID, okH := gitSnap.LookupRef("refs/heads/" + pr.HeadRef)
 	if !okB || !okH {
 		return "CONFLICTING"
 	}
@@ -523,8 +575,8 @@ func (r *Repository) MergePull(number int, commitTitle string) (mergeSHA string,
 	gitSnap := r.gitSnap.Load()
 	baseRef := "refs/heads/" + pr.BaseRef
 	headRef := "refs/heads/" + pr.HeadRef
-	baseOID, okB := gitSnap.Refs[baseRef]
-	headOID, okH := gitSnap.Refs[headRef]
+	baseOID, okB := gitSnap.LookupRef(baseRef)
+	headOID, okH := gitSnap.LookupRef(headRef)
 	if !okB || !okH {
 		return "", nil, &DomainError{Kind: ErrNotMergeable, Message: "Base or head branch no longer exists"}
 	}
@@ -547,10 +599,7 @@ func (r *Repository) MergePull(number int, commitTitle string) (mergeSHA string,
 		return "", nil, err
 	}
 
-	nextRefs := make(map[string]gitobj.OID, len(gitSnap.Refs))
-	for k, v := range gitSnap.Refs {
-		nextRefs[k] = v
-	}
+	nextRefs := gitSnap.CopyRefs(0)
 	nextRefs[baseRef] = commitObj.OID
 	r.gitSnap.Store(r.buildGitSnapshot(gitSnap.Version+1, nextRefs))
 

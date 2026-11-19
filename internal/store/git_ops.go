@@ -5,22 +5,39 @@ import (
 	"encoding/base64"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gitforge/internal/gitobj"
 )
 
+func wrapGitHTTP200(contentType string, body []byte) (fullHTTP []byte, bodySlice []byte) {
+	var hdrStack [192]byte
+	hdr := append(hdrStack[:0], "HTTP/1.1 200 OK\r\nContent-Type: "...)
+	hdr = append(hdr, contentType...)
+	hdr = append(hdr, "\r\nCache-Control: no-cache\r\nContent-Length: "...)
+	hdr = strconv.AppendInt(hdr, int64(len(body)), 10)
+	hdr = append(hdr, "\r\n\r\n"...)
+	buf := make([]byte, len(hdr)+len(body))
+	copy(buf, hdr)
+	copy(buf[len(hdr):], body)
+	return buf, buf[len(hdr):]
+}
+
 // UploadV2Capabilities is the pre-framed Smart HTTP v2 capability advertisement.
 var UploadV2Capabilities = func() []byte {
 	var b []byte
 	b = gitobj.AppendPktString(b, "version 2\n")
-	b = gitobj.AppendPktString(b, "agent=forge/1.0\n")
 	b = gitobj.AppendPktString(b, "ls-refs=unborn\n")
 	b = gitobj.AppendPktString(b, "fetch=shallow filter\n")
-	b = gitobj.AppendPktString(b, "server-option\n")
-	b = gitobj.AppendPktString(b, "object-format=sha1\n")
 	b = append(b, "0000"...)
 	return b
+}()
+
+// UploadV2CapsHTTP200 is the complete HTTP/1.1 200 OK wire response for Smart HTTP v2 info/refs.
+var UploadV2CapsHTTP200 = func() []byte {
+	full, _ := wrapGitHTTP200("application/x-git-upload-pack-advertisement", UploadV2Capabilities)
+	return full
 }()
 
 func (r *Repository) shardFor(oid gitobj.OID) *objShard {
@@ -81,13 +98,19 @@ func (r *Repository) GetCommit(oid gitobj.OID) (*gitobj.ParsedCommit, bool) {
 
 // PutObjects inserts immutable Git objects into the sharded store, parsing commits outside shard locks.
 func (r *Repository) PutObjects(objs []*gitobj.Object) error {
+	_, err := r.putObjectsFind(objs, gitobj.ZeroOID)
+	return err
+}
+
+func (r *Repository) putObjectsFind(objs []*gitobj.Object, findCommit gitobj.OID) (*gitobj.ParsedCommit, error) {
 	if len(objs) == 0 {
-		return nil
+		return nil, nil
 	}
 	type parsedPair struct {
 		obj *gitobj.Object
 		pc  *gitobj.ParsedCommit
 	}
+	var foundCommit *gitobj.ParsedCommit
 	// Stack-backed fast path for typical small pushes (e.g., 3 objects: blob + tree + commit)
 	if len(objs) <= 8 {
 		var stackPairs [8]parsedPair
@@ -97,7 +120,10 @@ func (r *Repository) PutObjects(objs []*gitobj.Object) error {
 				var err error
 				pc, err = gitobj.ParseCommit(obj.OID, obj.Raw)
 				if err != nil {
-					return err
+					return nil, err
+				}
+				if !findCommit.IsZero() && obj.OID == findCommit {
+					foundCommit = pc
 				}
 			}
 			stackPairs[i] = parsedPair{obj: obj, pc: pc}
@@ -114,7 +140,7 @@ func (r *Repository) PutObjects(objs []*gitobj.Object) error {
 			}
 			sh.mu.Unlock()
 		}
-		return nil
+		return foundCommit, nil
 	}
 
 	var byShard [16][]parsedPair
@@ -124,7 +150,10 @@ func (r *Repository) PutObjects(objs []*gitobj.Object) error {
 			var err error
 			pc, err = gitobj.ParseCommit(obj.OID, obj.Raw)
 			if err != nil {
-				return err
+				return nil, err
+			}
+			if !findCommit.IsZero() && obj.OID == findCommit {
+				foundCommit = pc
 			}
 		}
 		idx := obj.OID[0] & 0x0f
@@ -147,7 +176,7 @@ func (r *Repository) PutObjects(objs []*gitobj.Object) error {
 		}
 		sh.mu.Unlock()
 	}
-	return nil
+	return foundCommit, nil
 }
 
 func (r *Repository) peelTag(oid gitobj.OID) (gitobj.OID, bool) {
@@ -208,9 +237,24 @@ func (r *Repository) buildGitSnapshot(version uint64, refs map[string]gitobj.OID
 
 // UploadV0Advertisement lazily builds and caches the Protocol v0 upload-pack ref advertisement.
 func (s *GitSnapshot) UploadV0Advertisement() []byte {
+	s.ensureUploadV0()
+	return s.advUploadV0
+}
+
+// UploadV0HTTP200 returns the complete pre-framed HTTP/1.1 200 OK response for v0 upload-pack info/refs.
+func (s *GitSnapshot) UploadV0HTTP200() []byte {
+	s.ensureUploadV0()
+	return s.advUploadV0HTTP
+}
+
+func (s *GitSnapshot) ensureUploadV0() {
 	s.upAdvOnce.Do(func() {
 		uploadCaps := "multi_ack_detailed side-band-64k thin-pack ofs-delta shallow no-progress include-tag symref=HEAD:" + s.HeadTarget + " agent=forge/1.0 object-format=sha1"
-		upAdv := make([]byte, 0, 256+len(s.SortedRefs)*64)
+		var stackBuf [512]byte
+		upAdv := stackBuf[:0]
+		if len(s.SortedRefs) > 4 {
+			upAdv = make([]byte, 0, 256+len(s.SortedRefs)*64)
+		}
 		upAdv = gitobj.AppendPktString(upAdv, "# service=git-upload-pack\n")
 		upAdv = append(upAdv, "0000"...)
 		if len(s.SortedRefs) == 0 {
@@ -247,16 +291,63 @@ func (s *GitSnapshot) UploadV0Advertisement() []byte {
 			}
 		}
 		upAdv = append(upAdv, "0000"...)
-		s.advUploadV0 = upAdv
+		s.advUploadV0HTTP, s.advUploadV0 = wrapGitHTTP200("application/x-git-upload-pack-advertisement", upAdv)
 	})
-	return s.advUploadV0
 }
 
 // ReceiveV0Advertisement lazily builds and caches the Protocol v0 receive-pack ref advertisement.
 func (s *GitSnapshot) ReceiveV0Advertisement() []byte {
+	s.ensureReceiveV0()
+	return s.advReceiveV0
+}
+
+// ReceiveV0HTTP200 returns the complete pre-framed HTTP/1.1 200 OK response for receive-pack info/refs.
+func (s *GitSnapshot) ReceiveV0HTTP200() []byte {
+	s.ensureReceiveV0()
+	return s.advReceiveV0HTTP
+}
+
+// AppendReceiveV0HTTP200 formats the receive-pack info/refs HTTP/1.1 200 OK response directly into dst without heap allocations.
+func (s *GitSnapshot) AppendReceiveV0HTTP200(dst []byte) []byte {
+	const recvCaps = "report-status delete-refs side-band-64k quiet atomic ofs-delta object-format=sha1"
+	if len(s.SortedRefs) <= 2 {
+		var bodyStack [512]byte
+		body := bodyStack[:0]
+		body = gitobj.AppendPktString(body, "# service=git-receive-pack\n")
+		body = append(body, "0000"...)
+		if len(s.SortedRefs) == 0 {
+			body = gitobj.AppendPktString(body, gitobj.ZeroHex+" capabilities^{}\x00"+recvCaps+"\n")
+		} else {
+			var lineBuf [256]byte
+			for i, ent := range s.SortedRefs {
+				b := ent.OID.AppendHex(lineBuf[:0])
+				b = append(b, ' ')
+				b = append(b, ent.Name...)
+				if i == 0 {
+					b = append(b, 0)
+					b = append(b, recvCaps...)
+				}
+				b = append(b, '\n')
+				body = gitobj.AppendPktLine(body, b)
+			}
+		}
+		body = append(body, "0000"...)
+		dst = append(dst, "HTTP/1.1 200 OK\r\nContent-Type: application/x-git-receive-pack-advertisement\r\nCache-Control: no-cache\r\nContent-Length: "...)
+		dst = strconv.AppendInt(dst, int64(len(body)), 10)
+		dst = append(dst, "\r\n\r\n"...)
+		return append(dst, body...)
+	}
+	return append(dst, s.ReceiveV0HTTP200()...)
+}
+
+func (s *GitSnapshot) ensureReceiveV0() {
 	s.recvAdvOnce.Do(func() {
-		const recvCaps = "report-status report-status-v2 delete-refs side-band-64k quiet atomic ofs-delta agent=forge/1.0 object-format=sha1"
-		recvAdv := make([]byte, 0, 256+len(s.SortedRefs)*64)
+		const recvCaps = "report-status delete-refs side-band-64k quiet atomic ofs-delta object-format=sha1"
+		var stackBuf [512]byte
+		recvAdv := stackBuf[:0]
+		if len(s.SortedRefs) > 4 {
+			recvAdv = make([]byte, 0, 256+len(s.SortedRefs)*64)
+		}
 		recvAdv = gitobj.AppendPktString(recvAdv, "# service=git-receive-pack\n")
 		recvAdv = append(recvAdv, "0000"...)
 		if len(s.SortedRefs) == 0 {
@@ -276,9 +367,8 @@ func (s *GitSnapshot) ReceiveV0Advertisement() []byte {
 			}
 		}
 		recvAdv = append(recvAdv, "0000"...)
-		s.advReceiveV0 = recvAdv
+		s.advReceiveV0HTTP, s.advReceiveV0 = wrapGitHTTP200("application/x-git-receive-pack-advertisement", recvAdv)
 	})
-	return s.advReceiveV0
 }
 
 // Git returns the current lock-free GitSnapshot.
@@ -496,9 +586,64 @@ func isValidGitRefName(ref string) bool {
 	return true
 }
 
+func findInBatch(objs []*gitobj.Object, oid gitobj.OID) (*gitobj.Object, bool) {
+	for _, o := range objs {
+		if o.OID == oid {
+			return o, true
+		}
+	}
+	return nil, false
+}
+
+func (r *Repository) verifyTreeWithHint(tOID gitobj.OID, hint []*gitobj.Object) bool {
+	tObj, ok := findInBatch(hint, tOID)
+	if !ok {
+		tObj, ok = r.GetObject(tOID)
+	}
+	if !ok || tObj.Type != gitobj.ObjTree {
+		return false
+	}
+	raw := tObj.Raw
+	i := 0
+	for i < len(raw) {
+		sp := bytes.IndexByte(raw[i:], ' ')
+		if sp <= 0 {
+			return false
+		}
+		isDir := sp == 5 && string(raw[i:i+5]) == "40000" || sp == 6 && string(raw[i:i+6]) == "040000"
+		i += sp + 1
+		nul := bytes.IndexByte(raw[i:], 0)
+		if nul <= 0 {
+			return false
+		}
+		i += nul + 1
+		if i+20 > len(raw) {
+			return false
+		}
+		var childOID gitobj.OID
+		copy(childOID[:], raw[i:i+20])
+		i += 20
+		if isDir {
+			if !r.verifyTreeWithHint(childOID, hint) {
+				return false
+			}
+		} else {
+			if _, inBatch := findInBatch(hint, childOID); !inBatch && !r.HasObject(childOID) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // ReceivePack unpacks incoming objects OUTSIDE the repository write lock, then acquires
 // the short per-repo lock to validate CAS + fast-forward semantics and publish the new GitSnapshot.
 func (r *Repository) ReceivePack(cmds []PushCommand, packBytes []byte, atomicPush bool) (unpackErr string, statuses []RefStatus) {
+	return r.ReceivePackInto(cmds, packBytes, atomicPush, nil)
+}
+
+// ReceivePackInto is identical to ReceivePack but reuses statusDst when large enough to avoid slice allocations.
+func (r *Repository) ReceivePackInto(cmds []PushCommand, packBytes []byte, atomicPush bool, statusDst []RefStatus) (unpackErr string, statuses []RefStatus) {
 	// Phase 1 (outside repo.mu): unpack, verify SHA-1 checksum, resolve deltas, and store immutable objects.
 	hasUpdates := false
 	for _, c := range cmds {
@@ -507,18 +652,29 @@ func (r *Repository) ReceivePack(cmds []PushCommand, packBytes []byte, atomicPus
 			break
 		}
 	}
+	var objStack [8]*gitobj.Object
+	var unpackedObjs []*gitobj.Object
+	var fastTargetCommit *gitobj.ParsedCommit
+	wantFastOID := gitobj.ZeroOID
+	if len(cmds) == 1 && !cmds[0].NewOID.IsZero() {
+		wantFastOID = cmds[0].NewOID
+	}
+
 	if len(packBytes) > 0 || hasUpdates {
 		if len(packBytes) == 0 && hasUpdates {
 			return "missing packfile", nil
 		}
 		if len(packBytes) > 0 {
-			objs, err := gitobj.Unpack(packBytes, r.GetObject)
+			objs, err := gitobj.UnpackInto(packBytes, r.GetObject, objStack[:0])
 			if err != nil {
 				return err.Error(), nil
 			}
-			if err := r.PutObjects(objs); err != nil {
+			fc, err := r.putObjectsFind(objs, wantFastOID)
+			if err != nil {
 				return err.Error(), nil
 			}
+			unpackedObjs = objs
+			fastTargetCommit = fc
 		}
 	}
 
@@ -527,14 +683,94 @@ func (r *Repository) ReceivePack(cmds []PushCommand, packBytes []byte, atomicPus
 	defer r.mu.Unlock()
 
 	curSnap := r.gitSnap.Load()
-	workingRefs := make(map[string]gitobj.OID, len(curSnap.Refs)+len(cmds))
-	knownTips := make(map[gitobj.OID]struct{}, len(curSnap.Refs))
-	for k, v := range curSnap.Refs {
-		workingRefs[k] = v
-		knownTips[v] = struct{}{}
+
+	// Ultra-fast single-branch fast-forward update path (zero map / sort.Slice / RefEntry slice allocs for 1-ref repos)
+	if len(cmds) == 1 {
+		cmd := cmds[0]
+		if !cmd.OldOID.IsZero() && !cmd.NewOID.IsZero() && cmd.OldOID != cmd.NewOID &&
+			strings.HasPrefix(cmd.Ref, "refs/heads/") && isValidGitRefName(cmd.Ref) {
+			if curOID, exists := curSnap.LookupRef(cmd.Ref); exists && curOID == cmd.OldOID {
+				pc := fastTargetCommit
+				if pc == nil {
+					if c, ok := r.GetCommit(cmd.NewOID); ok {
+						pc = c
+					}
+				}
+				if pc != nil && len(pc.Parents) == 1 && pc.Parents[0] == cmd.OldOID {
+					var treeOK bool
+					if len(unpackedObjs) <= 8 {
+						treeOK = r.verifyTreeWithHint(pc.Tree, unpackedObjs)
+					} else {
+						treeOK = r.verifyTreeSimple(pc.Tree)
+					}
+					if treeOK {
+						if cap(statusDst) >= 1 {
+							statuses = statusDst[:1]
+						} else {
+							statuses = make([]RefStatus, 1)
+						}
+						statuses[0] = RefStatus{
+							Ref:    cmd.Ref,
+							OldOID: cmd.OldOID,
+							NewOID: cmd.NewOID,
+							OK:     true,
+						}
+						headOID := curSnap.HeadOID
+						hasHead := curSnap.HasHead
+						if cmd.Ref == curSnap.HeadTarget {
+							headOID = cmd.NewOID
+							hasHead = true
+						}
+						if len(curSnap.SortedRefs) == 1 && curSnap.SortedRefs[0].Name == cmd.Ref {
+							next := &GitSnapshot{
+								Repo:       r,
+								Version:    curSnap.Version + 1,
+								HeadTarget: curSnap.HeadTarget,
+								HeadOID:    headOID,
+								HasHead:    hasHead,
+							}
+							next.singleRef[0] = RefEntry{Name: cmd.Ref, OID: cmd.NewOID}
+							next.SortedRefs = next.singleRef[:1]
+							r.gitSnap.Store(next)
+							return "", statuses
+						}
+						nextRefs := curSnap.CopyRefs(0)
+						nextRefs[cmd.Ref] = cmd.NewOID
+						nextSorted := make([]RefEntry, len(curSnap.SortedRefs))
+						copy(nextSorted, curSnap.SortedRefs)
+						for i := range nextSorted {
+							if nextSorted[i].Name == cmd.Ref {
+								nextSorted[i].OID = cmd.NewOID
+								break
+							}
+						}
+						r.gitSnap.Store(&GitSnapshot{
+							Repo:       r,
+							Version:    curSnap.Version + 1,
+							Refs:       nextRefs,
+							SortedRefs: nextSorted,
+							HeadTarget: curSnap.HeadTarget,
+							HeadOID:    headOID,
+							HasHead:    hasHead,
+						})
+						return "", statuses
+					}
+				}
+			}
+		}
 	}
 
-	statuses = make([]RefStatus, len(cmds))
+	workingRefs := curSnap.CopyRefs(len(cmds))
+	knownTips := make(map[gitobj.OID]struct{}, len(curSnap.SortedRefs))
+	for _, ent := range curSnap.SortedRefs {
+		knownTips[ent.OID] = struct{}{}
+	}
+
+	if cap(statusDst) >= len(cmds) {
+		statuses = statusDst[:len(cmds)]
+	} else {
+		statuses = make([]RefStatus, len(cmds))
+	}
 	anyFailed := false
 	anyChanged := false
 
@@ -663,11 +899,26 @@ func (r *Repository) LsRefs(args LsRefsArgs) []byte {
 	snap := r.gitSnap.Load()
 	if args.Peel && args.Symrefs && len(args.RefPrefixes) == 0 && (snap.HasHead || !args.Unborn) {
 		snap.lsRefsSymPeelOnce.Do(func() {
-			snap.lsRefsSymPeel = r.formatLsRefs(snap, args)
+			raw := r.formatLsRefs(snap, args)
+			snap.lsRefsSymPeelHTTP, snap.lsRefsSymPeel = wrapGitHTTP200("application/x-git-upload-pack-result", raw)
 		})
 		return snap.lsRefsSymPeel
 	}
 	return r.formatLsRefs(snap, args)
+}
+
+// LsRefsHTTP200 returns the cached HTTP/1.1 200 OK wire response when args matches the standard ls-refs fast path,
+// or nil if the caller should format dynamically via LsRefs.
+func (r *Repository) LsRefsHTTP200(args LsRefsArgs) []byte {
+	snap := r.gitSnap.Load()
+	if args.Peel && args.Symrefs && len(args.RefPrefixes) == 0 && (snap.HasHead || !args.Unborn) {
+		snap.lsRefsSymPeelOnce.Do(func() {
+			raw := r.formatLsRefs(snap, args)
+			snap.lsRefsSymPeelHTTP, snap.lsRefsSymPeel = wrapGitHTTP200("application/x-git-upload-pack-result", raw)
+		})
+		return snap.lsRefsSymPeelHTTP
+	}
+	return nil
 }
 
 func (r *Repository) formatLsRefs(snap *GitSnapshot, args LsRefsArgs) []byte {
@@ -761,7 +1012,7 @@ func (r *Repository) FetchUploadPack(args FetchArgs) ([]byte, error) {
 		snap.depth1Once.Do(func() {
 			framed, err := r.buildFetchFramed(args)
 			if err == nil {
-				snap.depth1Framed = framed
+				snap.depth1FramedHTTP, snap.depth1Framed = wrapGitHTTP200("application/x-git-upload-pack-result", framed)
 			}
 		})
 		if len(snap.depth1Framed) > 0 {
@@ -770,6 +1021,24 @@ func (r *Repository) FetchUploadPack(args FetchArgs) ([]byte, error) {
 	}
 
 	return r.buildFetchFramed(args)
+}
+
+// FetchDepth1HTTP200 returns the cached HTTP/1.1 200 OK wire response for a depth-1 shallow fetch of HEAD,
+// or nil if the request does not match the snapshot-scoped fast path.
+func (r *Repository) FetchDepth1HTTP200(args FetchArgs) []byte {
+	snap := r.gitSnap.Load()
+	if args.Protocol == 2 && args.Done && args.Depth == 1 &&
+		snap.HasHead && len(args.Wants) == 1 && args.Wants[0] == snap.HeadOID &&
+		len(args.Haves) == 0 && len(args.ClientShallow) == 0 {
+		snap.depth1Once.Do(func() {
+			framed, err := r.buildFetchFramed(args)
+			if err == nil {
+				snap.depth1FramedHTTP, snap.depth1Framed = wrapGitHTTP200("application/x-git-upload-pack-result", framed)
+			}
+		})
+		return snap.depth1FramedHTTP
+	}
+	return nil
 }
 
 func (r *Repository) buildFetchFramed(args FetchArgs) ([]byte, error) {
@@ -1093,13 +1362,10 @@ func (r *Repository) CreateRef(ref string, sha string) (gitobj.OID, error) {
 	defer r.mu.Unlock()
 
 	curSnap := r.gitSnap.Load()
-	if _, exists := curSnap.Refs[ref]; exists {
+	if _, exists := curSnap.LookupRef(ref); exists {
 		return gitobj.ZeroOID, &DomainError{Kind: ErrUnprocessable, Message: "Reference already exists"}
 	}
-	nextRefs := make(map[string]gitobj.OID, len(curSnap.Refs)+1)
-	for k, v := range curSnap.Refs {
-		nextRefs[k] = v
-	}
+	nextRefs := curSnap.CopyRefs(1)
 	nextRefs[ref] = oid
 	r.gitSnap.Store(r.buildGitSnapshot(curSnap.Version+1, nextRefs))
 	return oid, nil
@@ -1129,7 +1395,7 @@ func (r *Repository) ListBranches() []BranchInfo {
 // GetBranch looks up a single branch by name (including names containing '/').
 func (r *Repository) GetBranch(branch string) (BranchInfo, bool) {
 	snap := r.gitSnap.Load()
-	oid, ok := snap.Refs["refs/heads/"+branch]
+	oid, ok := snap.LookupRef("refs/heads/" + branch)
 	if !ok {
 		return BranchInfo{}, false
 	}
@@ -1145,13 +1411,13 @@ func (r *Repository) ResolveCommitish(ref string) (gitobj.OID, bool) {
 		}
 		return gitobj.ZeroOID, false
 	}
-	if oid, ok := snap.Refs["refs/heads/"+ref]; ok {
+	if oid, ok := snap.LookupRef("refs/heads/" + ref); ok {
 		return oid, true
 	}
-	if oid, ok := snap.Refs[ref]; ok {
+	if oid, ok := snap.LookupRef(ref); ok {
 		return oid, true
 	}
-	if oid, ok := snap.Refs["refs/tags/"+ref]; ok {
+	if oid, ok := snap.LookupRef("refs/tags/" + ref); ok {
 		if pc, ok := r.GetCommit(oid); ok {
 			return pc.OID, true
 		}
@@ -1493,7 +1759,7 @@ func (r *Repository) PutContent(repoPath string, rawContent []byte, message, bra
 	var hasParent bool
 	var baseTree gitobj.OID
 
-	if tip, ok := curSnap.Refs[refName]; ok {
+	if tip, ok := curSnap.LookupRef(refName); ok {
 		parentOID = tip
 		hasParent = true
 		if pc, ok := r.GetCommit(tip); ok {
@@ -1547,10 +1813,7 @@ func (r *Repository) PutContent(repoPath string, rawContent []byte, message, bra
 		return ContentItem{}, "", false, err
 	}
 
-	nextRefs := make(map[string]gitobj.OID, len(curSnap.Refs)+1)
-	for k, v := range curSnap.Refs {
-		nextRefs[k] = v
-	}
+	nextRefs := curSnap.CopyRefs(1)
 	nextRefs[refName] = commitObj.OID
 	r.gitSnap.Store(r.buildGitSnapshot(curSnap.Version+1, nextRefs))
 
@@ -1578,7 +1841,7 @@ func (r *Repository) DeleteContent(repoPath, message, branch, expectedSHA string
 	defer r.mu.Unlock()
 
 	curSnap := r.gitSnap.Load()
-	tip, ok := curSnap.Refs[refName]
+	tip, ok := curSnap.LookupRef(refName)
 	if !ok {
 		return "", &DomainError{Kind: ErrNotFound, Message: "Branch not found"}
 	}
@@ -1609,10 +1872,7 @@ func (r *Repository) DeleteContent(repoPath, message, branch, expectedSHA string
 		return "", err
 	}
 
-	nextRefs := make(map[string]gitobj.OID, len(curSnap.Refs))
-	for k, v := range curSnap.Refs {
-		nextRefs[k] = v
-	}
+	nextRefs := curSnap.CopyRefs(0)
 	nextRefs[refName] = commitObj.OID
 	r.gitSnap.Store(r.buildGitSnapshot(curSnap.Version+1, nextRefs))
 	return commitObj.OID.Hex(), nil

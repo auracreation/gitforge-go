@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -15,10 +16,11 @@ import (
 // It caches its packfile representation ([packVarintHeader + zlibStream]) so
 // clones and fetches never re-deflate unchanged objects.
 type Object struct {
-	OID       OID
-	Type      ObjectType
-	Raw       []byte
-	packEntry atomic.Pointer[[]byte]
+	OID            OID
+	Type           ObjectType
+	Raw            []byte
+	packEntryBytes []byte // immutable when known at unpack time (zero atomic indirection)
+	packEntry      atomic.Pointer[[]byte]
 }
 
 // NewObject constructs an immutable Object, computing its OID.
@@ -35,21 +37,20 @@ func NewObject(typ ObjectType, raw []byte) *Object {
 // NewObjectWithPackEntry constructs an Object whose pack entry bytes
 // (pack varint header + verified zlib stream) are already known from receive-pack.
 func NewObjectWithPackEntry(oid OID, typ ObjectType, raw []byte, entryBytes []byte) *Object {
-	obj := &Object{
-		OID:  oid,
-		Type: typ,
-		Raw:  raw,
+	return &Object{
+		OID:            oid,
+		Type:           typ,
+		Raw:            raw,
+		packEntryBytes: entryBytes,
 	}
-	if len(entryBytes) > 0 {
-		e := entryBytes
-		obj.packEntry.Store(&e)
-	}
-	return obj
 }
 
 // PackEntry returns the immutable [packObjectHeader + zlibCompressedPayload] slice,
 // computing and caching it once if the object did not arrive from a plain pack entry.
 func (o *Object) PackEntry() []byte {
+	if len(o.packEntryBytes) > 0 {
+		return o.packEntryBytes
+	}
 	if p := o.packEntry.Load(); p != nil {
 		return *p
 	}
@@ -193,15 +194,55 @@ func ParseTree(raw []byte) ([]TreeEntry, error) {
 	return entries, nil
 }
 
-// ParsedCommit holds pre-parsed metadata for fast commit listing, merge-base, and ancestry walks.
+// ParsedCommit holds pre-parsed commit graph links (tree + parents) with lazy author/message parsing
+// so Git push and clone paths incur zero string/time allocations.
 type ParsedCommit struct {
 	OID           OID
 	Tree          OID
 	Parents       []OID
+	parentBuf     [2]OID
+	raw           []byte
+	metaOnce      sync.Once
 	AuthorName    string
 	AuthorEmail   string
 	AuthorDateISO string
 	Message       string
+}
+
+// EnsureMetadata lazily parses author identity, ISO date, and commit message on first access.
+func (pc *ParsedCommit) EnsureMetadata() {
+	pc.metaOnce.Do(func() {
+		pc.AuthorDateISO = "2025-01-01T00:00:00Z"
+		raw := pc.raw
+		hdrEnd := bytes.Index(raw, []byte("\n\n"))
+		var hdrBytes []byte
+		if hdrEnd >= 0 {
+			hdrBytes = raw[:hdrEnd]
+			pc.Message = string(raw[hdrEnd+2:])
+		} else {
+			hdrBytes = raw
+		}
+		rem := hdrBytes
+		for len(rem) > 0 {
+			var line []byte
+			if nl := bytes.IndexByte(rem, '\n'); nl >= 0 {
+				line = rem[:nl]
+				rem = rem[nl+1:]
+			} else {
+				line = rem
+				rem = nil
+			}
+			if len(line) > 7 && string(line[:7]) == "author " {
+				name, email, iso := parseIdentityLine(string(line[7:]))
+				pc.AuthorName = name
+				pc.AuthorEmail = email
+				if iso != "" {
+					pc.AuthorDateISO = iso
+				}
+				return
+			}
+		}
+	})
 }
 
 // BuildCommit formats a canonical Git commit payload.
@@ -226,23 +267,17 @@ func BuildCommit(tree OID, parents []OID, authorName, authorEmail string, epochS
 	return b.Bytes()
 }
 
-// ParseCommit parses raw Git commit payload bytes without intermediate []string header split allocations.
+// ParseCommit parses tree and parent OIDs from raw Git commit payload bytes with zero auxiliary allocations.
+// Call EnsureMetadata() before reading AuthorName, AuthorEmail, AuthorDateISO, or Message.
 func ParseCommit(oid OID, raw []byte) (*ParsedCommit, error) {
 	pc := &ParsedCommit{
-		OID:           oid,
-		AuthorDateISO: "2025-01-01T00:00:00Z",
+		OID: oid,
+		raw: raw,
 	}
-	hdrEnd := bytes.Index(raw, []byte("\n\n"))
-	var hdrBytes []byte
-	if hdrEnd >= 0 {
-		hdrBytes = raw[:hdrEnd]
-		pc.Message = string(raw[hdrEnd+2:])
-	} else {
-		hdrBytes = raw
-	}
+	pc.Parents = pc.parentBuf[:0]
 
 	var hasTree bool
-	rem := hdrBytes
+	rem := raw
 	for len(rem) > 0 {
 		var line []byte
 		if nl := bytes.IndexByte(rem, '\n'); nl >= 0 {
@@ -252,26 +287,26 @@ func ParseCommit(oid OID, raw []byte) (*ParsedCommit, error) {
 			line = rem
 			rem = nil
 		}
-		switch {
-		case len(line) >= 45 && string(line[:5]) == "tree ":
+		if len(line) == 0 {
+			break // end of commit header block
+		}
+		if len(line) >= 45 && string(line[:5]) == "tree " {
 			t, ok := ParseOIDBytes(bytes.TrimSpace(line[5:]))
 			if !ok {
 				return nil, errors.New("invalid commit tree OID")
 			}
 			pc.Tree = t
 			hasTree = true
-		case len(line) >= 47 && string(line[:7]) == "parent ":
+		} else if len(line) >= 47 && string(line[:7]) == "parent " {
 			p, ok := ParseOIDBytes(bytes.TrimSpace(line[7:]))
 			if !ok {
 				return nil, errors.New("invalid commit parent OID")
 			}
 			pc.Parents = append(pc.Parents, p)
-		case len(line) > 7 && string(line[:7]) == "author ":
-			name, email, iso := parseIdentityLine(string(line[7:]))
-			pc.AuthorName = name
-			pc.AuthorEmail = email
-			if iso != "" {
-				pc.AuthorDateISO = iso
+		} else if len(line) > 7 && string(line[:7]) == "author " {
+			// Parents always precede author in Git commit format; stop scanning once tree is found
+			if hasTree {
+				break
 			}
 		}
 	}

@@ -81,37 +81,20 @@ func (r *sliceByteReader) ReadByte() (byte, error) {
 	return c, nil
 }
 
-func inflateExact(src []byte, expectedSize int) (raw []byte, consumed int, err error) {
-	sr := &sliceByteReader{b: src}
-	var zr io.ReadCloser
-	if pooled := zlibReaderPool.Get(); pooled != nil {
-		zr = pooled.(io.ReadCloser)
-		if err := zr.(zlib.Resetter).Reset(sr, nil); err != nil {
-			return nil, 0, err
-		}
-	} else {
-		var err error
-		zr, err = zlib.NewReader(sr)
-		if err != nil {
-			return nil, 0, err
-		}
-	}
+var scratchPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 8192)
+		return &b
+	},
+}
 
+func inflateExact(src []byte, expectedSize int) (raw []byte, consumed int, err error) {
 	out := make([]byte, expectedSize)
-	n, readErr := io.ReadFull(zr, out)
-	if readErr != nil && !(readErr == io.EOF && expectedSize == 0) {
-		_ = zr.Close()
-		return nil, 0, fmt.Errorf("zlib inflate short read (%d/%d): %w", n, expectedSize, readErr)
+	consumed, err = inflateZlibInto(src, out)
+	if err != nil {
+		return nil, 0, err
 	}
-	// Drain trailing Adler-32 checksum to advance sr.pos to exact end of compressed stream
-	var extra [1]byte
-	m, eofErr := zr.Read(extra[:])
-	_ = zr.Close()
-	if m != 0 || eofErr != io.EOF {
-		return nil, 0, errors.New("zlib stream has unexpected trailing uncompressed data")
-	}
-	zlibReaderPool.Put(zr)
-	return out, sr.pos, nil
+	return out, consumed, nil
 }
 
 type rawPackEntry struct {
@@ -120,13 +103,23 @@ type rawPackEntry struct {
 	baseOffset int
 	baseOID    OID
 	data       []byte // raw data for 1..4, delta instructions for 6..7
-	packSlice  []byte // exact [varintHeader + zlibStream] for plain 1..4 entries
+	packStart  int    // start offset in pack for plain 1..4 entries
+	packLen    int    // length in pack for plain 1..4 entries
+	rawOff     int    // offset in scratch buffer for plain 1..4 entries
+	rawLen     int    // uncompressed length for plain 1..4 entries
+	oid        OID
 	resolved   *Object
 }
 
 // Unpack verifies the SHA-1 trailer of a Git v2/v3 packfile and inflates all objects,
 // resolving OFS_DELTA and REF_DELTA entries against earlier pack entries or lookupExternal.
 func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, error) {
+	return UnpackInto(pack, lookupExternal, nil)
+}
+
+// UnpackInto unpacks pack into dst (reusing dst's backing array when large enough)
+// and packs all plain Object structs and their inflated + pack-entry bytes into contiguous slabs.
+func UnpackInto(pack []byte, lookupExternal func(OID) (*Object, bool), dst []*Object) ([]*Object, error) {
 	if len(pack) < 32 {
 		return nil, errors.New("packfile shorter than 32-byte minimum")
 	}
@@ -147,6 +140,12 @@ func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, e
 	if !bytes.Equal(expectedSum[:], pack[bodyLen:]) {
 		return nil, errors.New("packfile SHA-1 checksum mismatch")
 	}
+	if count == 0 {
+		if bodyLen != 12 {
+			return nil, errors.New("trailing unparsed bytes before packfile trailer")
+		}
+		return dst[:0], nil
+	}
 
 	var stackEntries [8]rawPackEntry
 	var entries []rawPackEntry
@@ -156,6 +155,20 @@ func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, e
 		entries = make([]rawPackEntry, count)
 	}
 	var unresolved []int
+
+	// Scratch buffer accumulates all plain inflated bytes during unpack so we can commit them
+	// together with all plain packEntry slices into ONE contiguous slab allocation at the end.
+	scratchPtr := scratchPool.Get().(*[]byte)
+	scratch := (*scratchPtr)[:0]
+	defer func() {
+		if cap(scratch) <= maxPooledBufCap {
+			*scratchPtr = scratch[:0]
+			scratchPool.Put(scratchPtr)
+		}
+	}()
+
+	totalPlainPackBytes := 0
+	plainCount := 0
 
 	pos := 12
 	for i := 0; i < count; i++ {
@@ -187,19 +200,34 @@ func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, e
 		}
 		switch typ {
 		case ObjCommit, ObjTree, ObjBlob, ObjTag:
-			inflated, consumed, err := inflateExact(pack[pos:bodyLen], int(size))
+			sz := int(size)
+			rawOff := len(scratch)
+			if cap(scratch)-rawOff < sz {
+				newCap := cap(scratch) * 2
+				if newCap < rawOff+sz {
+					newCap = rawOff + sz
+				}
+				grown := make([]byte, rawOff+sz, newCap)
+				copy(grown, scratch)
+				scratch = grown
+			} else {
+				scratch = scratch[:rawOff+sz]
+			}
+			rawSlice := scratch[rawOff : rawOff+sz]
+			consumed, err := inflateZlibInto(pack[pos:bodyLen], rawSlice)
 			if err != nil {
 				return nil, err
 			}
-			// Allocate inflated + packSlice in one contiguous backing buffer to halve GC objects per object!
 			rawEntryLen := (pos - entryStart) + consumed
-			entryCopy := make([]byte, rawEntryLen)
-			copy(entryCopy, pack[entryStart:entryStart+rawEntryLen])
 			pos += consumed
 
-			oid := HashObject(typ, inflated)
-			obj := NewObjectWithPackEntry(oid, typ, inflated, entryCopy)
-			ent.resolved = obj
+			ent.oid = HashObject(typ, rawSlice)
+			ent.rawOff = rawOff
+			ent.rawLen = sz
+			ent.packStart = entryStart
+			ent.packLen = rawEntryLen
+			totalPlainPackBytes += rawEntryLen
+			plainCount++
 
 		case ObjOfsDelta:
 			if pos >= bodyLen {
@@ -254,6 +282,49 @@ func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, e
 		return nil, errors.New("trailing unparsed bytes before packfile trailer")
 	}
 
+	// Commit all plain Objects and their bytes into ONE Object slab + ONE byte slab!
+	objSlab := make([]Object, count)
+	if plainCount > 0 {
+		totalSlabBytes := len(scratch) + totalPlainPackBytes
+		byteSlab := make([]byte, totalSlabBytes)
+		copy(byteSlab, scratch)
+		packDst := len(scratch)
+		if plainCount == count {
+			// All pack entries are contiguous in pack[12:bodyLen]: single bulk copy!
+			copy(byteSlab[packDst:], pack[12:bodyLen])
+			for i := range entries {
+				ent := &entries[i]
+				rawCopy := byteSlab[ent.rawOff : ent.rawOff+ent.rawLen : ent.rawOff+ent.rawLen]
+				peOff := packDst + (ent.packStart - 12)
+				peCopy := byteSlab[peOff : peOff+ent.packLen : peOff+ent.packLen]
+				objSlab[i] = Object{
+					OID:            ent.oid,
+					Type:           ent.typ,
+					Raw:            rawCopy,
+					packEntryBytes: peCopy,
+				}
+				ent.resolved = &objSlab[i]
+			}
+		} else {
+			for i := range entries {
+				ent := &entries[i]
+				if ent.typ >= ObjCommit && ent.typ <= ObjTag {
+					rawCopy := byteSlab[ent.rawOff : ent.rawOff+ent.rawLen : ent.rawOff+ent.rawLen]
+					peCopy := byteSlab[packDst : packDst+ent.packLen : packDst+ent.packLen]
+					copy(peCopy, pack[ent.packStart:ent.packStart+ent.packLen])
+					packDst += ent.packLen
+					objSlab[i] = Object{
+						OID:            ent.oid,
+						Type:           ent.typ,
+						Raw:            rawCopy,
+						packEntryBytes: peCopy,
+					}
+					ent.resolved = &objSlab[i]
+				}
+			}
+		}
+	}
+
 	// Lazily build offset/OID maps ONLY when the packfile actually contains OFS_DELTA or REF_DELTA entries
 	if len(unresolved) > 0 {
 		byOffset := make(map[int]int, count)
@@ -294,11 +365,12 @@ func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, e
 					return nil, err
 				}
 				oid := HashObject(base.Type, targetRaw)
-				obj := &Object{
+				objSlab[idx] = Object{
 					OID:  oid,
 					Type: base.Type,
 					Raw:  targetRaw,
 				}
+				obj := &objSlab[idx]
 				ent.resolved = obj
 				ent.data = nil
 				byOID[oid] = obj
@@ -311,7 +383,12 @@ func Unpack(pack []byte, lookupExternal func(OID) (*Object, bool)) ([]*Object, e
 		}
 	}
 
-	out := make([]*Object, count)
+	var out []*Object
+	if cap(dst) >= count {
+		out = dst[:count]
+	} else {
+		out = make([]*Object, count)
+	}
 	for i := range entries {
 		out[i] = entries[i].resolved
 	}

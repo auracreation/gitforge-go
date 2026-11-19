@@ -920,7 +920,7 @@ func (ctx *execContext) resolvePullRequest(repo *store.Repository, pr *store.Pul
 			out[key] = pr.BaseRef
 		case "headRefOid":
 			if pr.State == "open" {
-				if hOID, ok := repo.Git().Refs["refs/heads/"+pr.HeadRef]; ok {
+				if hOID, ok := repo.Git().LookupRef("refs/heads/" + pr.HeadRef); ok {
 					out[key] = hOID.Hex()
 					continue
 				}
@@ -928,7 +928,7 @@ func (ctx *execContext) resolvePullRequest(repo *store.Repository, pr *store.Pul
 			out[key] = pr.HeadSHA
 		case "baseRefOid":
 			if pr.State == "open" {
-				if bOID, ok := repo.Git().Refs["refs/heads/"+pr.BaseRef]; ok {
+				if bOID, ok := repo.Git().LookupRef("refs/heads/" + pr.BaseRef); ok {
 					out[key] = bOID.Hex()
 					continue
 				}
